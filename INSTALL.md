@@ -139,6 +139,14 @@ Notes:
 - **Emergency login** (checkbox) is only for a local emergency account on a computer in mode B. Leave it off normally.
 - After a successful login you get screen, mouse and keyboard only. There is no file transfer or clipboard.
 
+### Help requests from colleagues
+
+- **Colleague:** double-click the SecureVNC icon next to the clock (or right-click → **Request help…**), optionally describe the problem, **Send**.
+- **You:** SecureVNC Client shows a notification "PC-05 (ivan) asks for help". Click it (or double-click the request in **Help requests from colleagues**); the computer is filled in. Enter your password and code and **Connect**.
+- Tick **Keep running in the tray** and **Start with Windows** in the client so you do not miss requests.
+- Only requests signed by a computer whose certificate you trust are shown (import the organization CA, or connect once). A request is only a notice; logging in is unchanged.
+- Works on the same local network (UDP 5904). The setup opens this port in the client's firewall for the local subnet; the portable client asks Windows for permission the first time.
+
 ---
 
 ## 6. Everyday administration

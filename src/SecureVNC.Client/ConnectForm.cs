@@ -1,6 +1,7 @@
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
+using SecureVNC.Shared.Help;
 using SecureVNC.Shared.Protocol;
 
 namespace SecureVNC.Client;
@@ -19,9 +20,22 @@ internal sealed class ConnectForm : Form
     private readonly Label _status = new() { AutoSize = true, ForeColor = Color.DimGray };
     private readonly CheckBox _emergency = new() { Text = "Emergency login (local account on that computer, not the auth server)", AutoSize = true };
 
-    private sealed record Settings(string Host, int Port, string User);
+    private sealed record Settings(string Host, int Port, string User, bool StayInTray = true);
 
-    public ConnectForm()
+    // ----- help requests from colleagues (signed UDP broadcast, see HelpRequests) -----
+    private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private readonly ListView _requests = new() { View = View.Details, FullRowSelect = true, MultiSelect = false, Width = 520, Height = 110, HideSelection = false };
+    private readonly CheckBox _stayInTray = new() { Text = "Keep running in the tray to receive help requests", AutoSize = true, Checked = true };
+    private readonly CheckBox _startWithWindows = new() { Text = "Start with Windows", AutoSize = true };
+    private readonly NotifyIcon _tray = new() { Icon = SystemIcons.Shield, Text = "SecureVNC Client", Visible = true };
+    private readonly Label _helpStatus = new() { AutoSize = true, ForeColor = Color.DimGray, MaximumSize = new Size(520, 0) };
+    private HelpListener? _listener;
+    private VerifiedHelpRequest? _balloonRequest;
+    private bool _exiting;
+
+    public ConnectForm() : this(false, true) { }
+
+    public ConnectForm(bool startHidden, bool listenForHelp)
     {
         Text = ClientPaths.IsPortable ? "SecureVNC (portable)" : "SecureVNC";
         Icon = SystemIcons.Shield;
@@ -53,6 +67,24 @@ internal sealed class ConnectForm : Form
         grid.SetColumnSpan(buttons, 2);
         grid.Controls.Add(_status);
         grid.SetColumnSpan(_status, 2);
+
+        var helpBox = new GroupBox { Text = "Help requests from colleagues", AutoSize = true, Padding = new Padding(8, 4, 8, 8), Margin = new Padding(3, 10, 3, 3) };
+        var helpFlow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Dock = DockStyle.Fill };
+        _requests.Columns.Add("Time", 60);
+        _requests.Columns.Add("Computer", 120);
+        _requests.Columns.Add("User", 110);
+        _requests.Columns.Add("Problem", 210);
+        _requests.DoubleClick += (_, _) => UseSelectedRequest();
+        var useRequest = new Button { Text = "Connect to selected", AutoSize = true };
+        useRequest.Click += (_, _) => UseSelectedRequest();
+        helpFlow.Controls.Add(_requests);
+        helpFlow.Controls.Add(useRequest);
+        helpFlow.Controls.Add(_stayInTray);
+        helpFlow.Controls.Add(_startWithWindows);
+        helpFlow.Controls.Add(_helpStatus);
+        helpBox.Controls.Add(helpFlow);
+        grid.Controls.Add(helpBox);
+        grid.SetColumnSpan(helpBox, 2);
         Controls.Add(grid);
 
         AcceptButton = _connect;
@@ -62,6 +94,107 @@ internal sealed class ConnectForm : Form
 
         LoadSettings();
         Shown += (_, _) => (_host.Text.Length == 0 ? _host : _password).Focus();
+
+        _startWithWindows.Checked = IsStartWithWindows();
+        _startWithWindows.CheckedChanged += (_, _) => SetStartWithWindows(_startWithWindows.Checked);
+        _stayInTray.CheckedChanged += (_, _) => SaveTrayChoice();
+        var trayMenu = new ContextMenuStrip();
+        trayMenu.Items.Add("Open SecureVNC", null, (_, _) => ShowFromTray());
+        trayMenu.Items.Add(new ToolStripSeparator());
+        trayMenu.Items.Add("Exit", null, (_, _) => ExitApp());
+        _tray.ContextMenuStrip = trayMenu;
+        _tray.DoubleClick += (_, _) => ShowFromTray();
+        _tray.BalloonTipClicked += (_, _) =>
+        {
+            ShowFromTray();
+            if (_balloonRequest is { } r) FillFromRequest(r);
+        };
+
+        if (listenForHelp) StartHelpListener();
+        else _helpStatus.Text = "Another SecureVNC Client window already receives help requests.";
+        if (startHidden) CreateHandle();
+    }
+
+    private void StartHelpListener()
+    {
+        try
+        {
+            _listener = new HelpListener(() => TrustStore.Load().AllTrusted());
+            _listener.Received += r => BeginInvoke(() => OnHelpRequest(r));
+            _helpStatus.Text = "Listening for help requests on the local network (UDP 5904). Only computers with a certificate you trust are shown.";
+        }
+        catch (System.Net.Sockets.SocketException ex)
+        {
+            _helpStatus.Text = $"Cannot receive help requests: {ex.Message}";
+        }
+    }
+
+    private void OnHelpRequest(VerifiedHelpRequest r)
+    {
+        var item = new ListViewItem([r.ReceivedLocal.ToString("HH:mm"), r.Request.Computer, r.Request.User, r.Request.Text]) { Tag = r };
+        _requests.Items.Insert(0, item);
+        while (_requests.Items.Count > 50) _requests.Items.RemoveAt(_requests.Items.Count - 1);
+        _balloonRequest = r;
+        var problem = r.Request.Text.Length > 0 ? $": {r.Request.Text}" : "";
+        _tray.ShowBalloonTip(15000, "SecureVNC - help requested",
+            $"{r.Request.Computer} ({r.Request.User}) asks for help{problem}\nClick to connect.", ToolTipIcon.Info);
+    }
+
+    private void UseSelectedRequest()
+    {
+        if (_requests.SelectedItems.Count == 0) return;
+        FillFromRequest((VerifiedHelpRequest)_requests.SelectedItems[0].Tag!);
+    }
+
+    /// <summary>Fills in the computer from the request's certificate; logging in stays password + code.</summary>
+    private void FillFromRequest(VerifiedHelpRequest r)
+    {
+        _host.Text = r.ConnectTo;
+        _port.Value = Rfb.DefaultPort;
+        _status.Text = $"Help request from {r.Request.Computer} ({r.Request.User}). Enter your password and code, then Connect.";
+        (_user.Text.Length == 0 ? _user : _password).Focus();
+    }
+
+    private void ShowFromTray()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
+    }
+
+    private void ExitApp()
+    {
+        _exiting = true;
+        _listener?.Dispose();
+        _tray.Visible = false;
+        _tray.Dispose();
+        Application.Exit();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!_exiting && _stayInTray.Checked && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            Hide();
+            return;
+        }
+        _listener?.Dispose();
+        _tray.Visible = false;
+        base.OnFormClosing(e);
+    }
+
+    private static bool IsStartWithWindows()
+    {
+        using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey);
+        return key?.GetValue("SecureVNC Client") is string;
+    }
+
+    private static void SetStartWithWindows(bool on)
+    {
+        using var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey);
+        if (on) key.SetValue("SecureVNC Client", $"\"{Environment.ProcessPath}\" --tray");
+        else key.DeleteValue("SecureVNC Client", throwOnMissingValue: false);
     }
 
     private async Task ConnectAsync()
@@ -84,7 +217,7 @@ internal sealed class ConnectForm : Form
         {
             var trust = TrustStore.Load();
             var client = await Task.Run(() => RfbClient.Connect(options, trust, AskTrust));
-            SaveSettings(options);
+            SaveSettings(options, _stayInTray.Checked);
             _password.Clear();
             _code.Clear();
             _status.Text = "";
@@ -169,13 +302,20 @@ internal sealed class ConnectForm : Form
             _host.Text = s.Host;
             _port.Value = Math.Clamp(s.Port, 1, 65535);
             _user.Text = s.User;
+            _stayInTray.Checked = s.StayInTray;
         }
         catch { /* ignore broken settings */ }
     }
 
-    private static void SaveSettings(ConnectOptions o)
+    private static void SaveSettings(ConnectOptions o, bool stayInTray)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile)!);
-        File.WriteAllText(SettingsFile, JsonSerializer.Serialize(new Settings(o.Host, o.Port, o.User)));
+        File.WriteAllText(SettingsFile, JsonSerializer.Serialize(new Settings(o.Host, o.Port, o.User, stayInTray)));
+    }
+
+    private void SaveTrayChoice()
+    {
+        try { SaveSettings(new ConnectOptions(_host.Text.Trim(), (int)_port.Value, _user.Text.Trim(), "", ""), _stayInTray.Checked); }
+        catch { /* settings are a convenience */ }
     }
 }

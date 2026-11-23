@@ -408,6 +408,44 @@ bool created = Directory.Exists(missing);
 ServerPaths.UseDataDir(realDataDir);
 Check(!created, "a log line does not create a missing data folder");
 
+// ----- "Request help" (signed UDP broadcast) -----
+using (var mine = CertificateManager.LoadProtected(ServerPaths.ServerCertFile))
+using (var impostorCa = CertificateManager.CreateCa("Impostor CA"))
+using (var impostorLeaf = CertificateManager.IssueServerCertificate(impostorCa, [Environment.MachineName], [System.Net.IPAddress.Loopback]))
+{
+    var trusted = new System.Security.Cryptography.X509Certificates.X509Certificate2Collection(orgCa);
+    var loopback = System.Net.IPAddress.Loopback;
+    var packet = SecureVNC.Shared.Help.HelpRequests.Create(mine, "ivan", "printer does not print\r\nFAKE LINE");
+    SecureVNC.Shared.Help.VerifiedHelpRequest? help = null;
+    err = Try(() => help = SecureVNC.Shared.Help.HelpRequests.Verify(packet, loopback, trusted));
+    Check(err is null && help!.Request.User == "ivan" && help.Request.Computer == myName && !help.Request.Text.Contains('\n'),
+        $"help request: signed by the computer, accepted, text kept on one line {err?.Message}");
+    Check(help is not null && (help.ConnectTo == "127.0.0.1" || help.ConnectTo == myName), $"help request: Connect goes to the certificate's address or name ({help?.ConnectTo})");
+
+    var tampered = (byte[])packet.Clone();
+    int textAt = System.Text.Encoding.ASCII.GetString(tampered).IndexOf("printer", StringComparison.Ordinal);
+    tampered[textAt] = (byte)'P';
+    Check(Try(() => SecureVNC.Shared.Help.HelpRequests.Verify(tampered, loopback, trusted)) is not null, "help request: changed text refused (signature)");
+    Check(Try(() => SecureVNC.Shared.Help.HelpRequests.Verify(SecureVNC.Shared.Help.HelpRequests.Create(impostorLeaf, "eve", "click me"), loopback, trusted)) is not null,
+        "help request: computer with an untrusted certificate refused");
+    Check(Try(() => SecureVNC.Shared.Help.HelpRequests.Verify(SecureVNC.Shared.Help.HelpRequests.Create(mine, "ivan", "x", DateTimeOffset.UtcNow.AddMinutes(-10)), loopback, trusted)) is not null,
+        "help request: old (replayed) request refused");
+    Check(Try(() => SecureVNC.Shared.Help.HelpRequests.Verify(SecureVNC.Shared.Help.HelpRequests.Create(mine, "ivan", "x", computer: "OTHER-PC"), loopback, trusted)) is not null,
+        "help request: request naming another computer refused");
+
+    // Over the network: sent 3 times, shown once.
+    int shown = 0;
+    using var gotOne = new ManualResetEventSlim();
+    using (var listener = new SecureVNC.Shared.Help.HelpListener(() => trusted, port: 15904, bind: loopback))
+    {
+        listener.Received += _ => { Interlocked.Increment(ref shown); gotOne.Set(); };
+        SecureVNC.Shared.Help.HelpRequests.Broadcast(SecureVNC.Shared.Help.HelpRequests.Create(mine, "ivan", "help"), [new System.Net.IPEndPoint(loopback, 15904)]);
+        gotOne.Wait(3000);
+        Thread.Sleep(500);
+    }
+    Check(shown == 1, $"help request over UDP: received and shown once (shown {shown}x)");
+}
+
 server.Stop();
 auth.Stop();
 Thread.Sleep(300);

@@ -1,6 +1,6 @@
 # SecureVNC – Roadmap
 
-Planned work, in the intended order. Nothing here is implemented yet.
+Planned work, in the intended order. Done so far: item 0, phase A (1.5.0).
 
 ## Features
 
@@ -15,7 +15,7 @@ For colleagues who find computers hard: they ask for help with one click, the ad
   - **Connect** goes to the computer named in the certificate, never to an address taken from the message;
   - logging in is unchanged (password + code + ticket). Fake requests are impossible without the computer's key, and even a fake one could not reveal a password;
   - rate limit per computer against spam.
-- **Phase A (first):** signed UDP broadcast on the local network. Works in local and central mode; same network only; the viewer needs an inbound UDP firewall rule.
+- **Phase A – done in 1.5.0:** signed UDP broadcast on the local network. Works in local and central mode; same network only; the viewer needs an inbound UDP firewall rule.
 - **Phase B (with WireGuard, item 3):** requests delivered through the Auth Server over the computer's authenticated connection. Works across subnets and VPN, keeps a queue while viewers are off, every request in the audit; the viewer logs in to an administrator "inbox".
 - Size: phase A medium; phase B medium to large.
 

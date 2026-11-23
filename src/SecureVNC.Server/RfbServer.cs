@@ -133,6 +133,9 @@ internal sealed class RfbServer(ServerConfig config)
     }
 
     /// <summary>Re-checks at most once a minute that the certificate still matches the machine's addresses.</summary>
+    /// <summary>The certificate this computer currently presents (also signs "Request help").</summary>
+    internal ServerCredentials CurrentCredentials() => GetCredentials();
+
     private ServerCredentials GetCredentials()
     {
         lock (_credsLock)

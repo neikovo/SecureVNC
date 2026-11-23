@@ -121,6 +121,10 @@ internal sealed class TrayContext : ApplicationContext
         _addressItem = new ToolStripMenuItem("") { Enabled = false };
         _sessionsItem = new ToolStripMenuItem("No active sessions") { Enabled = false };
         var menu = new ContextMenuStrip();
+        var help = new ToolStripMenuItem("Request help...") { Font = new Font(menu.Font, FontStyle.Bold) };
+        help.Click += (_, _) => RequestHelp();
+        menu.Items.Add(help);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem($"SecureVNC - port {server.Port}{(agent ? " (service)" : "")}") { Enabled = false });
         menu.Items.Add(_addressItem);
         menu.Items.Add(_sessionsItem);
@@ -142,6 +146,8 @@ internal sealed class TrayContext : ApplicationContext
             ContextMenuStrip = menu,
             Visible = true,
         };
+
+        _icon.DoubleClick += (_, _) => RequestHelp();
 
         server.SessionStarted += s => OnUi(() =>
         {
@@ -181,6 +187,49 @@ internal sealed class TrayContext : ApplicationContext
         _addressItem.Text = $"{Environment.MachineName}  {string.Join(", ", _addresses)}";
     }
 
+    private DateTime _lastHelpUtc = DateTime.MinValue;
+    private bool _helpOpen;
+
+    /// <summary>Asks for a short description, then broadcasts a request signed with this computer's certificate.</summary>
+    private void RequestHelp()
+    {
+        if (_helpOpen) return;
+        if (DateTime.UtcNow - _lastHelpUtc < TimeSpan.FromSeconds(30))
+        {
+            _icon.ShowBalloonTip(4000, "SecureVNC", "Your request was sent. An administrator will connect soon.", ToolTipIcon.Info);
+            return;
+        }
+        string text;
+        _helpOpen = true;
+        try
+        {
+            using var dlg = new HelpRequestDialog();
+            if (dlg.ShowDialog() != DialogResult.OK) return;
+            text = dlg.Description;
+        }
+        finally
+        {
+            _helpOpen = false;
+        }
+        _lastHelpUtc = DateTime.UtcNow;
+        string user = SessionUser.Name();
+        Task.Run(() =>
+        {
+            try
+            {
+                var packet = Shared.Help.HelpRequests.Create(_server.CurrentCredentials().ServerCertificate, user, text);
+                Shared.Help.HelpRequests.Broadcast(packet);
+                Log.Info($"Help requested by '{user}': {text}");
+                OnUi(() => _icon.ShowBalloonTip(5000, "SecureVNC", "Help requested. An administrator will connect to this computer.", ToolTipIcon.Info));
+            }
+            catch (Exception ex)
+            {
+                Log.Info($"Help request failed: {ex.Message}");
+                OnUi(() => _icon.ShowBalloonTip(5000, "SecureVNC", "The help request could not be sent. Please call your administrator.", ToolTipIcon.Error));
+            }
+        });
+    }
+
     private void OnUi(Action a)
     {
         if (!_ui.IsDisposed) _ui.BeginInvoke(a);
@@ -201,7 +250,7 @@ internal sealed class TrayContext : ApplicationContext
             1 => $"SecureVNC - CONNECTED: {sessions[0].UserName} ({NetworkInfo.Display(sessions[0].Remote)})",
             _ => $"SecureVNC - CONNECTED: {sessions.Count} sessions",
         };
-        var text = $"{status}\nIP: {(_addresses.Count == 0 ? "no network" : string.Join(", ", _addresses))}\nPort {_server.Port}";
+        var text = $"{status}\nIP: {(_addresses.Count == 0 ? "no network" : string.Join(", ", _addresses))}\nDouble-click: request help";
         _icon.Text = text.Length <= 127 ? text : text[..124] + "...";
     }
 

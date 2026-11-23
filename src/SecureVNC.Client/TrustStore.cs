@@ -46,6 +46,14 @@ public sealed class TrustStore
     public X509Certificate2Collection Imported() =>
         new(ImportedCas.Select(b => new X509Certificate2(Convert.FromBase64String(b))).ToArray());
 
+    /// <summary>Every CA this viewer trusts: pinned for a host, or imported.</summary>
+    public X509Certificate2Collection AllTrusted()
+    {
+        var all = new X509Certificate2Collection();
+        foreach (var b64 in Hosts.Values.Concat(ImportedCas).Distinct()) all.Add(new X509Certificate2(Convert.FromBase64String(b64)));
+        return all;
+    }
+
     public void TrustHost(string host, X509Certificate2 ca)
     {
         Hosts[host] = Convert.ToBase64String(ca.RawData);

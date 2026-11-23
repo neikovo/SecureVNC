@@ -61,6 +61,11 @@ Name: "{group}\SecureVNC Manager";      Filename: "{app}\Server\SecureVNC.Manage
 Name: "{group}\SecureVNC Auth Console"; Filename: "{app}\Auth\SecureVNC.Manager.exe"; Parameters: "--auth"; Components: auth
 
 [Run]
+; Client: receive "Request help" broadcasts from colleagues (UDP 5904, local subnet only).
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""SecureVNC Client (help requests)"""; \
+    Components: client; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""SecureVNC Client (help requests)"" dir=in action=allow protocol=UDP localport=5904 program=""{app}\Client\SecureVNC.Client.exe"" remoteip=localsubnet profile=private,domain"; \
+    Components: client; Flags: runhidden
 Filename: "{app}\Auth\SecureVNC.Manager.exe"; Parameters: "--auth --first-run"; Description: "Open SecureVNC Auth Console (administrators, join key)"; \
     Components: auth; Flags: postinstall runascurrentuser nowait skipifsilent
 Filename: "{app}\Server\SecureVNC.Manager.exe"; Parameters: "--first-run"; Description: "Open SecureVNC Manager (users, certificate)"; \
@@ -69,6 +74,8 @@ Filename: "{app}\Client\SecureVNC.Client.exe"; Description: "Start SecureVNC Cli
     Components: client; Flags: postinstall nowait skipifsilent unchecked
 
 [UninstallRun]
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""SecureVNC Client (help requests)"""; \
+    Components: client; Flags: runhidden; RunOnceId: "RemoveHelpFirewallRule"
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Server\configure-server.ps1"" -Remove"; \
     Components: server; Flags: runhidden waituntilterminated; RunOnceId: "RemoveSecureVncService"
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Auth\configure-auth.ps1"" -Remove"; \
