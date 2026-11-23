@@ -215,4 +215,4 @@ SecureVNC Manager and the Auth Console ask for a SecureVNC login (password + cod
 - [ ] Lost or retired computers are **blocked** in the Auth Console.
 - [ ] The **Audit** tab is checked regularly.
 
-For how SecureVNC works and how it is protected, see [README.md](README.md) (Bulgarian).
+For how SecureVNC works and how it is protected, see [README.md](README.md) (Bulgarian). Planned features: [ROADMAP.md](ROADMAP.md).
