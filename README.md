@@ -2,6 +2,8 @@
 
 Отдалечен достъп за Windows в локална мрежа: базиран на VNC (RFB протокол), с криптиране (TLS 1.3), локален сертификат (собствен CA на всеки сървър) и MFA с Google Authenticator.
 
+**Installation guide (English): [INSTALL.md](INSTALL.md)**
+
 ## Части
 
 | Проект | Какво е |
