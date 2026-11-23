@@ -14,6 +14,8 @@ namespace SecureVNC.Shared.Central;
 ///   renew   (client certificate)     new public key                   -> new certificate (new IP address)
 ///   verify  (client certificate)     user + password + code + client  -> ok / failed
 ///   ping    (client certificate)                                      -> ok + computer name (status check)
+///   ticket  (viewer, no certificate) user + password + code + computer + nonce -> signed ticket (see Tickets)
+///   confirm (client certificate)     ticket number + nonce            -> ok + user, once per ticket
 /// </summary>
 public static class CentralProtocol
 {
@@ -88,6 +90,12 @@ public sealed class CentralRequest
     public string? Code { get; set; }
     /// <summary>Address of the viewer that is logging in to the computer (for lockout and audit).</summary>
     public string? ClientAddress { get; set; }
+    /// <summary>ticket: the computer the viewer wants; confirm: unused.</summary>
+    public string? Computer { get; set; }
+    /// <summary>ticket / confirm: the computer's nonce for this connection (base64).</summary>
+    public string? Nonce { get; set; }
+    /// <summary>confirm: the ticket number.</summary>
+    public string? TicketId { get; set; }
 }
 
 public sealed class CentralResponse
@@ -99,4 +107,9 @@ public sealed class CentralResponse
     public string? Certificate { get; set; }
     /// <summary>Organization CA (DER, base64).</summary>
     public string? CaCertificate { get; set; }
+    /// <summary>ticket: the signed ticket (JSON, base64) and its signature (base64).</summary>
+    public string? Ticket { get; set; }
+    public string? Signature { get; set; }
+    /// <summary>confirm: the user the ticket was issued to.</summary>
+    public string? User { get; set; }
 }

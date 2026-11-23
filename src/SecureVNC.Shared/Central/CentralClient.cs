@@ -72,6 +72,16 @@ public static class CentralClient
         });
     }
 
+    /// <summary>Step 5 of the ticket login: the auth server confirms it issued this ticket for this computer (once).</summary>
+    public static CentralResponse ConfirmTicket(ServerConfig config, string ticketId, string nonceBase64)
+    {
+        using var cert = CertificateManager.LoadProtected(ServerPaths.ServerCertFile);
+        return Call(config.AuthServer!, config.AuthServerFingerprint!, cert, new CentralRequest
+        {
+            Op = "confirm", TicketId = ticketId, Nonce = nonceBase64,
+        });
+    }
+
     /// <summary>Status check for SecureVNC Manager.</summary>
     public static CentralResponse Ping(ServerConfig config)
     {
@@ -185,6 +195,7 @@ public static class CentralClient
         chain.ChainPolicy.CustomTrustStore.Add(ca);
         chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
         chain.ChainPolicy.ApplicationPolicy.Add(new Oid("1.3.6.1.5.5.7.3.1"));
+        chain.ChainPolicy.ApplicationPolicy.Add(new Oid(Tickets.AuthServerEkuOid));   // a computer certificate cannot pose as the auth server
         return chain.Build(leaf) && leaf.MatchesHostname(host, allowWildcards: false, allowCommonName: false);
     }
 }

@@ -11,7 +11,10 @@ public static class Rfb
     public const int DefaultPort = 5901;
 
     // Security
-    public const byte SecurityTypeSecureVnc = 0x80;   // SecureVNC: CA delivery + password + TOTP
+    public const byte SecurityTypeSecureVnc = 0x80;   // SecureVNC: CA delivery + password + TOTP (checked on the computer)
+    public const byte SecurityTypeTicket = 0x81;      // SecureVNC central mode: CA + name + auth server + nonce, then a signed ticket
+    public const int MaxTicketBytes = 4096;
+    public const int TicketNonceBytes = 32;
     public const uint SecurityResultOk = 0;
     public const uint SecurityResultFailed = 1;
     public const int MaxUserNameBytes = 64;

@@ -6,11 +6,13 @@ using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using SecureVNC.Shared.Central;
 using SecureVNC.Shared.Protocol;
 
 namespace SecureVNC.Client;
 
-public sealed record ConnectOptions(string Host, int Port, string User, string Password, string Code);
+/// <param name="Emergency">Send the password to the computer itself (local emergency account), even if it belongs to an auth server.</param>
+public sealed record ConnectOptions(string Host, int Port, string User, string Password, string Code, bool Emergency = false);
 
 /// <summary>How the user answered a certificate question.</summary>
 public delegate bool TrustPrompt(X509Certificate2 ca, bool caChanged);
@@ -85,14 +87,27 @@ public sealed class RfbClient : IDisposable
 
         int count = _r.U8();
         if (count == 0) throw new AuthenticationException(_r.LengthPrefixedString(4096));
-        if (!_r.ReadBytes(count).Contains(Rfb.SecurityTypeSecureVnc))
-            throw new ProtocolException("The server does not offer SecureVNC authentication.");
-        Send(w => w.U8(Rfb.SecurityTypeSecureVnc));
+        var types = _r.ReadBytes(count);
+        bool useTicket = types.Contains(Rfb.SecurityTypeTicket) && !o.Emergency;
+        if (!useTicket && !types.Contains(Rfb.SecurityTypeSecureVnc))
+            throw new ProtocolException(o.Emergency
+                ? "This computer has no local emergency accounts: use a normal login."
+                : "The server does not offer SecureVNC authentication.");
+        Send(w => w.U8(useTicket ? Rfb.SecurityTypeTicket : Rfb.SecurityTypeSecureVnc));
 
         uint caLen = _r.U32();
         if (caLen is 0 or > 65536) throw new ProtocolException("Bad CA certificate from server.");
         using var presentedCa = new X509Certificate2(_r.ReadBytes((int)caLen));
-        VerifyServer(o.Host, leaf ?? throw new AuthenticationException("No server certificate."), presentedCa, trust, prompt);
+        string computerName = "", authServer = "";
+        byte[] nonce = [];
+        if (useTicket)
+        {
+            computerName = _r.LengthPrefixedString(255);
+            authServer = _r.LengthPrefixedString(255);
+            nonce = _r.ReadBytes(Rfb.TicketNonceBytes);
+        }
+        // The CA this user trusts for the host - never the one the computer merely sent along.
+        var trustedCa = VerifyServer(o.Host, leaf ?? throw new AuthenticationException("No server certificate."), presentedCa, trust, prompt);
 
         var user = Encoding.UTF8.GetBytes(o.User);
         var pass = Encoding.UTF8.GetBytes(o.Password);
@@ -100,7 +115,26 @@ public sealed class RfbClient : IDisposable
         if (pass.Length > Rfb.MaxPasswordBytes) throw new ArgumentException("Password is too long.");
         if (o.Code.Length != Rfb.TotpCodeLength || !o.Code.All(char.IsAsciiDigit))
             throw new ArgumentException("The authenticator code must be 6 digits.");
-        Send(w => w.U8((byte)user.Length).Bytes(user).U8((byte)pass.Length).Bytes(pass).Bytes(Encoding.ASCII.GetBytes(o.Code)));
+
+        if (useTicket)
+        {
+            // The password goes only to the auth server; the computer gets a ticket bound to it and to this connection.
+            var response = Tickets.RequestTicket(authServer, trustedCa, o.User, o.Password, o.Code, computerName, nonce);
+            if (!response.Ok) throw new AuthenticationException(response.Error ?? "The auth server refused the login.");
+            var ticket = Convert.FromBase64String(response.Ticket!);
+            var signature = Convert.FromBase64String(response.Signature!);
+            Send(w => w.U16((ushort)ticket.Length).Bytes(ticket).U16((ushort)signature.Length).Bytes(signature));
+            LoginMethod = $"ticket from {authServer}";
+        }
+        else
+        {
+            if (IsOrganizationCa(trustedCa) && !o.Emergency)
+                throw new AuthenticationException(
+                    "This computer belongs to a SecureVNC auth server but asked for the password directly. It was NOT sent: " +
+                    "the computer may be an impostor. (Tick \"Emergency login\" only for a local emergency account on it.)");
+            Send(w => w.U8((byte)user.Length).Bytes(user).U8((byte)pass.Length).Bytes(pass).Bytes(Encoding.ASCII.GetBytes(o.Code)));
+            LoginMethod = o.Emergency ? "local emergency account" : "password checked by the computer";
+        }
 
         if (_r.U32() != Rfb.SecurityResultOk) throw new AuthenticationException(_r.LengthPrefixedString(4096));
 
@@ -122,17 +156,17 @@ public sealed class RfbClient : IDisposable
     /// Accepts the server only if its certificate is valid for the typed host name and chains to a CA
     /// this user trusts. A new CA needs the user's OK (fingerprint shown); a changed CA gets a warning.
     /// </summary>
-    private static void VerifyServer(string host, X509Certificate2 leaf, X509Certificate2 presentedCa, TrustStore trust, TrustPrompt prompt)
+    private static X509Certificate2 VerifyServer(string host, X509Certificate2 leaf, X509Certificate2 presentedCa, TrustStore trust, TrustPrompt prompt)
     {
         if (!leaf.MatchesHostname(host, allowWildcards: false, allowCommonName: false))
             throw new AuthenticationException($"The server certificate is not valid for '{host}'. Use the computer name or its current IP address.");
 
         var known = trust.CaForHost(host);
-        if (known is not null && TrustStore.ChainsTo(leaf, [known])) return;
-        if (known is null && TrustStore.ChainsTo(leaf, trust.Imported()))
+        if (known is not null && TrustStore.ChainsTo(leaf, [known])) return known;
+        if (known is null && trust.Imported().FirstOrDefault(ca => TrustStore.ChainsTo(leaf, [ca])) is { } imported)
         {
-            trust.TrustHost(host, presentedCa);
-            return;
+            trust.TrustHost(host, imported);
+            return imported;
         }
 
         if (!TrustStore.IsCa(presentedCa) || !TrustStore.ChainsTo(leaf, [presentedCa]))
@@ -140,7 +174,14 @@ public sealed class RfbClient : IDisposable
         if (!prompt(presentedCa, caChanged: known is not null))
             throw new OperationCanceledException("Connection cancelled: the server certificate was not trusted.");
         trust.TrustHost(host, presentedCa);
+        return presentedCa;
     }
+
+    /// <summary>"ticket from srv01", "local emergency account", ... (shown in the viewer).</summary>
+    public string LoginMethod { get; private set; } = "";
+
+    /// <summary>The organization CA of an auth server, as opposed to one computer's own CA.</summary>
+    private static bool IsOrganizationCa(X509Certificate2 ca) => ca.Subject.Contains("SecureVNC Organization CA");
 
     public void Start()
     {

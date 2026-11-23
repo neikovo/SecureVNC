@@ -99,40 +99,57 @@ internal sealed class ClientSession(
             return false;
         }
 
-        Send(w.Reset().U8(1).U8(Rfb.SecurityTypeSecureVnc));
-        if (r.U8() != Rfb.SecurityTypeSecureVnc) throw new ProtocolException("Client chose an unsupported security type");
+        // Central mode: ticket login (the password goes only to the auth server). Password login is offered there
+        // only for local emergency users, and never relayed to the auth server.
+        var config = ServerConfig.Load();
+        var offered = new List<byte>();
+        if (config.IsCentral) offered.Add(Rfb.SecurityTypeTicket);
+        if (!config.IsCentral || UserStore.Load().Users.Count > 0) offered.Add(Rfb.SecurityTypeSecureVnc);
+        Send(w.Reset().U8((byte)offered.Count).Bytes(offered.ToArray()));
+        byte chosen = r.U8();
+        if (!offered.Contains(chosen)) throw new ProtocolException("Client chose an unsupported security type");
 
         // Send our CA so a new client can show its fingerprint for first-time trust.
         var ca = creds.CaCertificate.RawData;
-        Send(w.Reset().U32((uint)ca.Length).Bytes(ca));
+        string user;
+        bool ok;
+        string message = "Authentication failed.";
+        if (chosen == Rfb.SecurityTypeTicket)
+        {
+            var nonce = System.Security.Cryptography.RandomNumberGenerator.GetBytes(Rfb.TicketNonceBytes);
+            var myName = Tickets.MyRegisteredName(creds.ServerCertificate);
+            Send(w.Reset().U32((uint)ca.Length).Bytes(ca)
+                .LengthPrefixedString(myName).LengthPrefixedString(config.AuthServer!).Bytes(nonce));
 
-        int userLen = r.U8();
-        if (userLen is 0 or > Rfb.MaxUserNameBytes) throw new ProtocolException("Bad user name length");
-        var user = Encoding.UTF8.GetString(r.ReadBytes(userLen));
-        int passLen = r.U8();
-        if (passLen > Rfb.MaxPasswordBytes) throw new ProtocolException("Bad password length");
-        var password = Encoding.UTF8.GetString(r.ReadBytes(passLen));
-        var code = Encoding.ASCII.GetString(r.ReadBytes(Rfb.TotpCodeLength));
+            int ticketLen = r.U16();
+            if (ticketLen is 0 or > Rfb.MaxTicketBytes) throw new ProtocolException("Bad ticket length");
+            var ticket = r.ReadBytes(ticketLen);
+            int signatureLen = r.U16();
+            if (signatureLen is 0 or > 256) throw new ProtocolException("Bad signature length");
+            var signature = r.ReadBytes(signatureLen);
+            (ok, user, message) = CheckTicket(config, ticket, signature, myName, nonce);
+        }
+        else
+        {
+            Send(w.Reset().U32((uint)ca.Length).Bytes(ca));
+            int userLen = r.U8();
+            if (userLen is 0 or > Rfb.MaxUserNameBytes) throw new ProtocolException("Bad user name length");
+            user = Encoding.UTF8.GetString(r.ReadBytes(userLen));
+            int passLen = r.U8();
+            if (passLen > Rfb.MaxPasswordBytes) throw new ProtocolException("Bad password length");
+            var password = Encoding.UTF8.GetString(r.ReadBytes(passLen));
+            var code = Encoding.ASCII.GetString(r.ReadBytes(Rfb.TotpCodeLength));
+            ok = !throttle.IsLocked($"user:{user.ToLowerInvariant()}") && UserStore.Authenticate(user, password, code);
+            if (ok && config.IsCentral) Log.Info($"{remote}: '{user}' logged in with a LOCAL EMERGENCY account");
+        }
 
         string userKey = $"user:{user.ToLowerInvariant()}";
-        var result = throttle.IsLocked(userKey)
-            ? LoginResult.Failed
-            : LoginVerifier.Verify(user, password, code, NetworkInfo.Display(remote));
-        if (result != LoginResult.Ok)
+        if (!ok)
         {
-            string message = "Authentication failed.";
-            if (result == LoginResult.Unavailable)
-            {
-                message = "The SecureVNC authentication server is not reachable. Try again later.";
-                Log.Info($"{remote}: login for '{user}' not possible: auth server unreachable");
-            }
-            else
-            {
-                throttle.Fail(ipKey);
-                throttle.Fail(userKey);
-                Log.Info($"{remote}: failed login for '{user}'");
-                Thread.Sleep(1000);
-            }
+            throttle.Fail(ipKey);
+            throttle.Fail(userKey);
+            Log.Info($"{remote}: failed login for '{user}': {message}");
+            Thread.Sleep(1000);
             Send(w.Reset().U32(Rfb.SecurityResultFailed).LengthPrefixedString(message));
             return false;
         }
@@ -150,6 +167,37 @@ internal sealed class ClientSession(
         w.LengthPrefixedString(Environment.MachineName);
         Send(w);
         return true;
+    }
+
+    /// <summary>
+    /// Ticket login: signature by the organization CA, for this computer, this connection and this viewer's address,
+    /// then the auth server itself confirms that it issued exactly this ticket for this computer (once).
+    /// </summary>
+    private (bool Ok, string User, string Message) CheckTicket(ServerConfig config, byte[] ticket, byte[] signature, string myName, byte[] nonce)
+    {
+        TicketPayload payload;
+        try
+        {
+            payload = Tickets.Check(ticket, signature, creds.CaCertificate, myName, nonce, NetworkInfo.Display(remote));
+        }
+        catch (Exception ex) when (ex is AuthenticationException or System.Text.Json.JsonException or FormatException)
+        {
+            return (false, "?", ex.Message);
+        }
+        if (throttle.IsLocked($"user:{payload.User.ToLowerInvariant()}")) return (false, payload.User, "Too many failed attempts.");
+
+        try
+        {
+            var confirm = CentralClient.ConfirmTicket(config, payload.Id, payload.Nonce);
+            return confirm.Ok && string.Equals(confirm.User, payload.User, StringComparison.Ordinal)
+                ? (true, payload.User, "")
+                : (false, payload.User, confirm.Error ?? "The auth server did not confirm the ticket.");
+        }
+        catch (Exception ex)
+        {
+            Log.Info($"{remote}: cannot confirm the ticket with the auth server: {ex.Message}");
+            return (false, payload.User, "The SecureVNC authentication server is not reachable. Try again later.");
+        }
     }
 
     private void ReadLoop(RfbReader r)

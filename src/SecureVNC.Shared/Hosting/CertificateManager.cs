@@ -43,13 +43,14 @@ public static class CertificateManager
     /// <summary>Signs a certificate for a public key (generated elsewhere, e.g. on a computer joining the auth server).</summary>
     public static X509Certificate2 IssueCertificate(
         X509Certificate2 ca, PublicKey publicKey, string commonName,
-        IEnumerable<string> dnsNames, IEnumerable<IPAddress> ips, bool clientAuth, TimeSpan? lifetime = null)
+        IEnumerable<string> dnsNames, IEnumerable<IPAddress> ips, bool clientAuth, TimeSpan? lifetime = null, string? extraEku = null)
     {
         var req = new CertificateRequest(new X500DistinguishedName($"CN={commonName}, O=SecureVNC"), publicKey, HashAlgorithmName.SHA256);
         req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
         req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
         var eku = new OidCollection { new Oid(ServerAuthOid) };
         if (clientAuth) eku.Add(new Oid(ClientAuthOid));
+        if (extraEku is not null) eku.Add(new Oid(extraEku));
         req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(eku, false));
         var san = new SubjectAlternativeNameBuilder();
         foreach (var d in dnsNames) san.AddDnsName(d);
@@ -67,11 +68,11 @@ public static class CertificateManager
     }
 
     public static X509Certificate2 IssueServerCertificate(
-        X509Certificate2 ca, IReadOnlyCollection<string> dnsNames, IReadOnlyCollection<IPAddress> ips)
+        X509Certificate2 ca, IReadOnlyCollection<string> dnsNames, IReadOnlyCollection<IPAddress> ips, string? extraEku = null)
     {
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
         var publicKey = PublicKey.CreateFromSubjectPublicKeyInfo(key.ExportSubjectPublicKeyInfo(), out _);
-        using var cert = IssueCertificate(ca, publicKey, Environment.MachineName, dnsNames, ips, clientAuth: false);
+        using var cert = IssueCertificate(ca, publicKey, Environment.MachineName, dnsNames, ips, clientAuth: false, extraEku: extraEku);
         return cert.CopyWithPrivateKey(key);
     }
 
@@ -115,6 +116,9 @@ public static class CertificateManager
         return dns.All(haveDns.Contains) && ips.All(haveIps.Contains);
     }
 
+    public static bool HasEku(X509Certificate2 cert, string oid) =>
+        cert.Extensions.OfType<X509EnhancedKeyUsageExtension>().Any(e => e.EnhancedKeyUsages.Cast<Oid>().Any(o => o.Value == oid));
+
     public static void SaveProtected(X509Certificate2 certWithKey, string path) =>
         File.WriteAllBytes(path, Dpapi.Protect(certWithKey.Export(X509ContentType.Pkcs12)));
 
@@ -151,17 +155,17 @@ public static class CertificateManager
     }
 
     /// <summary>Keeps a TLS certificate, signed by the CA in <paramref name="caKeyFile"/>, valid for this machine.</summary>
-    public static ServerCredentials EnsureLeaf(string caKeyFile, string leafFile, Action<string> log, bool forceReissue = false)
+    public static ServerCredentials EnsureLeaf(string caKeyFile, string leafFile, Action<string> log, bool forceReissue = false, string? extraEku = null)
     {
         using var ca = LoadProtected(caKeyFile);
         var (dns, ips) = CurrentIdentity();
         X509Certificate2? server = !forceReissue && File.Exists(leafFile) ? LoadProtected(leafFile) : null;
 
         if (server is null || server.NotAfter < DateTime.Now.AddDays(30) ||
-            server.Issuer != ca.Subject || !Covers(server, dns, ips))
+            server.Issuer != ca.Subject || !Covers(server, dns, ips) || (extraEku is not null && !HasEku(server, extraEku)))
         {
             server?.Dispose();
-            using (var fresh = IssueServerCertificate(ca, dns, ips))
+            using (var fresh = IssueServerCertificate(ca, dns, ips, extraEku))
                 SaveProtected(fresh, leafFile);
             // Reload from PFX: SChannel cannot use the ephemeral key of a freshly created certificate.
             server = LoadProtected(leafFile);

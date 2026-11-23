@@ -71,7 +71,7 @@ internal sealed class MainForm : ManagerForm
         _join.Visible = !config.IsCentral;
         _leave.Visible = config.IsCentral;
         BoxOf(_usersGroup).Text = config.IsCentral
-            ? "Local emergency users - accepted only while the auth server cannot be reached (normally none)"
+            ? "Local emergency users - only with \"Emergency login\" in the client (normally none)"
             : "Users (password + Google Authenticator)";
 
         if (!config.IsCentral)

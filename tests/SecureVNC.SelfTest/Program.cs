@@ -149,6 +149,8 @@ authConfig.Save(authPaths);
 var adminSecret = Totp.NewSecret();
 var admins = UserStore.Load(authPaths.UsersFile);
 admins.Users.Add(UserStore.CreateRecord("central", password, adminSecret, acceptedStep: 0));
+var adminSecret2 = Totp.NewSecret();
+admins.Users.Add(UserStore.CreateRecord("central2", password, adminSecret2, acceptedStep: 0));
 admins.Save();
 var auth = new CentralAuthService(authPaths);
 auth.Start("127.0.0.1");
@@ -168,7 +170,7 @@ server.Start();
 string CentralCode(int offset) => Totp.Compute(adminSecret, Totp.CurrentStep(DateTimeOffset.UtcNow) + offset);
 var centralCode0 = CentralCode(0);
 err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, centralCode0), TrustStore.Load(), Trust).Dispose());
-Check(err is null, $"central login (password + TOTP checked by the auth server) {err?.Message}");
+Check(err is null, $"central login with a ticket (password + TOTP go only to the auth server) {err?.Message}");
 err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, centralCode0), TrustStore.Load(), Trust).Dispose());
 Check(err is AuthenticationException, $"central: reused code rejected ({err?.Message})");
 err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "tester", password, Code(1)), TrustStore.Load(), Trust).Dispose());
@@ -205,6 +207,46 @@ err = Try(() => CentralClient.Join(authAddress, fingerprint, joinKey, _ => { }))
 Check(err?.Message.Contains("blocked") == true, $"blocked computer cannot unblock itself by joining again ({err?.Message})");
 ComputerStore.Update(authPaths, s => s.Computers[0].Revoked = false);
 
+// ----- Tickets: what a computer accepts -----
+var orgCa = new System.Security.Cryptography.X509Certificates.X509Certificate2(authPaths.CaCertFile);
+string myName;
+using (var mine = CertificateManager.LoadProtected(ServerPaths.ServerCertFile))
+{
+    myName = Tickets.MyRegisteredName(mine);
+    Check(!Tickets.IsAuthServer(mine, myName, orgCa), "a computer certificate cannot pose as the auth server");
+}
+var nonceA = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
+var tr = Tickets.RequestTicket(authAddress, orgCa, "central2", password,
+    Totp.Compute(adminSecret2, Totp.CurrentStep(DateTimeOffset.UtcNow)), myName, nonceA);
+Check(tr.Ok, $"auth server issues a ticket {tr.Error}");
+if (tr.Ok)
+{
+    var tk = Convert.FromBase64String(tr.Ticket!);
+    var sg = Convert.FromBase64String(tr.Signature!);
+    TicketPayload? payload = null;
+    err = Try(() => payload = Tickets.Check(tk, sg, orgCa, myName, nonceA, "127.0.0.1"));
+    Check(err is null && payload?.User == "central2", $"valid ticket accepted {err?.Message}");
+    Check(Try(() => Tickets.Check(tk, sg, orgCa, myName, System.Security.Cryptography.RandomNumberGenerator.GetBytes(32), "127.0.0.1")) is not null,
+        "ticket for another connection (nonce) refused");
+    Check(Try(() => Tickets.Check(tk, sg, orgCa, "OTHER-PC", nonceA, "127.0.0.1")) is not null, "ticket for another computer refused");
+    Check(Try(() => Tickets.Check(tk, sg, orgCa, myName, nonceA, "192.168.1.99")) is not null, "ticket used from another address refused");
+    var forged = Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(tk).Replace("central2", "centralX"));
+    Check(Try(() => Tickets.Check(forged, sg, orgCa, myName, nonceA, "127.0.0.1")) is AuthenticationException, "changed ticket (forged user) refused");
+    var confirm1 = CentralClient.ConfirmTicket(ServerConfig.Load(), payload!.Id, payload.Nonce);
+    var confirm2 = CentralClient.ConfirmTicket(ServerConfig.Load(), payload.Id, payload.Nonce);
+    Check(confirm1.Ok && confirm1.User == "central2" && !confirm2.Ok, "auth server confirms a ticket to its computer exactly once");
+}
+
+// Local emergency account: only with "Emergency login", password checked on the computer itself.
+var rescueSecret = Totp.NewSecret();
+var rescue = new UserStore();
+rescue.Users.Add(UserStore.CreateRecord("rescue", password, rescueSecret, acceptedStep: 0));
+rescue.Save();
+err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "rescue", password,
+    Totp.Compute(rescueSecret, Totp.CurrentStep(DateTimeOffset.UtcNow)), Emergency: true), TrustStore.Load(), Trust).Dispose());
+Check(err is null, $"emergency login with a local account {err?.Message}");
+File.Delete(ServerPaths.UsersFile);
+
 // Half-open connections are capped per address; the cap frees up again.
 var raw = new List<System.Net.Sockets.TcpClient>();
 for (int i = 0; i < 4; i++) { var t = new System.Net.Sockets.TcpClient(); t.Connect("127.0.0.1", 15901); raw.Add(t); }
@@ -224,7 +266,7 @@ Check(Log.OneLine("bob\r\n2026-01-01 LOGIN  user 'admin'") == "bob  2026-01-01 L
 auth.Stop();
 Thread.Sleep(300);
 err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, CentralCode(1)), TrustStore.Load(), Trust).Dispose());
-Check(err is AuthenticationException && err.Message.Contains("not reachable"), $"central: auth server down -> nobody logs in ({err?.Message})");
+Check(err is not null && err.Message.Contains("not reachable"), $"central: auth server down -> nobody logs in ({err?.Message})");
 
 // A clone: the saved identity is another computer's -> joins again with the saved join key.
 auth = new CentralAuthService(authPaths);
@@ -234,7 +276,8 @@ bool rejoined = false;
 err = Try(() => rejoined = MachineIdentity.Guard(_ => { }));
 Check(err is null && rejoined && MachineIdentity.Saved is { } id && MachineIdentity.Matches(id, MachineIdentity.Current),
     $"cloned computer joins again by itself {err?.Message}");
-err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, CentralCode(1)), TrustStore.Load(), Trust).Dispose());
+err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central2", password,
+    Totp.Compute(adminSecret2, Totp.CurrentStep(DateTimeOffset.UtcNow) + 1)), TrustStore.Load(), Trust).Dispose());
 Check(err is null, $"central login after re-join {err?.Message}");
 
 server.Stop();

@@ -55,6 +55,8 @@ public sealed class ComputerRecord
     public DateTime JoinedUtc { get; set; }
     public DateTime LastSeenUtc { get; set; }
     public string LastAddress { get; set; } = "";
+    /// <summary>The address in this computer's current certificate ("" = name only).</summary>
+    public string CertificateAddress { get; set; } = "";
     /// <summary>Blocked in the Auth Console: cannot log anyone in, renew its certificate or join again.</summary>
     public bool Revoked { get; set; }
     /// <summary>Joined while approval is required: waits for an administrator.</summary>
@@ -126,7 +128,7 @@ public static class AuthData
             log($"Organization CA created: {CertificateManager.Fingerprint(ca)}");
         }
         if (!File.Exists(paths.JoinKeyFile)) SetJoinKey(paths, CentralProtocol.NewJoinKey());
-        CertificateManager.EnsureLeaf(paths.CaKeyFile, paths.TlsCertFile, log).ServerCertificate.Dispose();
+        CertificateManager.EnsureLeaf(paths.CaKeyFile, paths.TlsCertFile, log, extraEku: Tickets.AuthServerEkuOid).ServerCertificate.Dispose();
     }
 
     public static string ReadJoinKey(AuthPaths paths) =>

@@ -28,6 +28,7 @@ public sealed partial class CentralAuthService(AuthPaths paths)
     private DateTime _credsCheckedUtc;
     private X509Certificate2? _ca;
     private readonly ConnectionLimiter _limiter = new(maxTotal: 64, maxPerAddress: 8);
+    private readonly TicketBook _tickets = new();
 
     public int Port => _config.Port;
 
@@ -118,6 +119,8 @@ public sealed partial class CentralAuthService(AuthPaths paths)
                 "renew" => WithComputer(computerCert, ip, c => Renew(request, c, ip), allowPending: true),
                 "verify" => WithComputer(computerCert, ip, c => Verify(request, c, ip)),
                 "ping" => WithComputer(computerCert, ip, c => new CentralResponse { Ok = true, MachineName = c.Name }),
+                "ticket" => IssueTicket(request, ip),
+                "confirm" => WithComputer(computerCert, ip, c => ConfirmTicket(request, c, ip)),
                 _ => new CentralResponse { Error = "Unknown request." },
             };
             CentralProtocol.Write(ssl, response);
@@ -199,7 +202,7 @@ public sealed partial class CentralAuthService(AuthPaths paths)
             return new CentralResponse { Error = $"A computer named {name} is already registered. Remove it in the Auth Console first." };
         }
 
-        var cert = Issue(name, guid, r.PublicKey, ip);
+        var (cert, certAddress) = Issue(name, guid, r.PublicKey, ip);
         bool pending = false;
         ComputerStore.Update(paths, store =>
         {
@@ -211,6 +214,7 @@ public sealed partial class CentralAuthService(AuthPaths paths)
             }
             pending = record.Pending;
             record.Serials = [cert.SerialNumber];   // joining again replaces the old certificates
+            record.CertificateAddress = certAddress;
             record.JoinedUtc = record.LastSeenUtc = DateTime.UtcNow;
             record.LastAddress = AuthData.Display(ip);
             return 0;
@@ -227,13 +231,14 @@ public sealed partial class CentralAuthService(AuthPaths paths)
     private CentralResponse Renew(CentralRequest r, ComputerRecord computer, IPAddress ip)
     {
         if (string.IsNullOrEmpty(r.PublicKey)) return new CentralResponse { Error = "Bad request." };
-        var cert = Issue(computer.Name, computer.MachineGuid, r.PublicKey, ip);
+        var (cert, certAddress) = Issue(computer.Name, computer.MachineGuid, r.PublicKey, ip);
         ComputerStore.Update(paths, store =>
         {
             var record = store.BySerial(computer.Serials[0]);
             if (record is null) return 0;
             record.Serials.Add(cert.SerialNumber);
             if (record.Serials.Count > 3) record.Serials.RemoveAt(0);
+            record.CertificateAddress = certAddress;
             record.LastSeenUtc = DateTime.UtcNow;
             record.LastAddress = AuthData.Display(ip);
             return 0;
@@ -281,10 +286,85 @@ public sealed partial class CentralAuthService(AuthPaths paths)
     }
 
     /// <summary>
+    /// A viewer asks for a ticket to one computer. Password and code are checked here; the computer only ever sees
+    /// the signed ticket, which is bound to it, to this viewer's address and to one connection.
+    /// </summary>
+    private CentralResponse IssueTicket(CentralRequest r, IPAddress ip)
+    {
+        var user = r.User ?? "";
+        var computerName = r.Computer ?? "";
+        string viewer = AuthData.Display(ip);
+        string userKey = $"user:{user.ToLowerInvariant()}", clientKey = $"client:{viewer}";
+
+        bool ok = !_throttle!.IsLocked(userKey) && !_throttle.IsLocked(clientKey)
+                  && UserStore.Authenticate(paths.UsersFile, user, r.Password ?? "", r.Code ?? "");
+        if (!ok)
+        {
+            _throttle.Fail(userKey);
+            _throttle.Fail(clientKey);
+            AuditLine($"LOGIN-FAILED  user '{user}' from {viewer} to {computerName}");
+            Thread.Sleep(1000);
+            return new CentralResponse { Error = "Authentication failed." };
+        }
+        _throttle.Success(userKey);
+        _throttle.Success(clientKey);
+
+        var computer = ComputerStore.Load(paths).Computers.FirstOrDefault(c =>
+            string.Equals(c.Name, computerName, StringComparison.OrdinalIgnoreCase));
+        if (computer is null || computer.Revoked || computer.Pending)
+        {
+            AuditLine($"TICKET-REFUSED  user '{user}' from {viewer} to {computerName}: computer {(computer is null ? "not registered" : computer.Revoked ? "blocked" : "waits for approval")}");
+            return new CentralResponse { Error = $"{computerName} is not allowed by the auth server." };
+        }
+        byte[] nonce;
+        try { nonce = Convert.FromBase64String(r.Nonce ?? ""); }
+        catch (FormatException) { return new CentralResponse { Error = "Bad request." }; }
+        if (nonce.Length != 32) return new CentralResponse { Error = "Bad request." };
+
+        var payload = new TicketPayload
+        {
+            Id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16)),
+            User = UserStore.Load(paths.UsersFile).Find(user)?.Name ?? user,
+            Computer = computer.Name,
+            ClientAddress = viewer,
+            Nonce = Convert.ToBase64String(nonce),
+            IssuedUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+        };
+        using var ca = CertificateManager.LoadProtected(paths.CaKeyFile);
+        using var key = ca.GetECDsaPrivateKey()!;
+        var (ticket, signature) = Tickets.Sign(payload, key);
+        _tickets.Add(payload);
+        AuditLine($"TICKET  user '{payload.User}' from {viewer} to {computer.Name}");
+        return new CentralResponse { Ok = true, Ticket = Convert.ToBase64String(ticket), Signature = Convert.ToBase64String(signature) };
+    }
+
+    /// <summary>The computer asks: did you issue this ticket for me? Each ticket is confirmed once.</summary>
+    private CentralResponse ConfirmTicket(CentralRequest r, ComputerRecord computer, IPAddress ip)
+    {
+        var payload = _tickets.Confirm(r.TicketId ?? "", computer.Name, r.Nonce ?? "");
+        if (payload is null)
+        {
+            AuditLine($"CONFIRM-REFUSED  ticket {r.TicketId} on {computer.Name} ({ip}): unknown, used, expired or for another computer");
+            return new CentralResponse { Error = "The auth server did not issue this ticket for this computer (or it was already used)." };
+        }
+        ComputerStore.Update(paths, store =>
+        {
+            if (store.Computers.FirstOrDefault(c => c.Same(computer.Name, computer.MachineGuid)) is { } record)
+            {
+                record.LastSeenUtc = DateTime.UtcNow;
+                record.LastAddress = AuthData.Display(ip);
+            }
+            return 0;
+        });
+        AuditLine($"LOGIN  user '{payload.User}' from {payload.ClientAddress} to {computer.Name} ({ip})");
+        return new CentralResponse { Ok = true, User = payload.User, MachineName = computer.Name };
+    }
+
+    /// <summary>
     /// The certificate names only this computer: its name and the address the auth server sees it on.
     /// Addresses the computer claims are not used, so it cannot obtain a certificate for someone else's address.
     /// </summary>
-    private X509Certificate2 Issue(string name, string machineGuid, string publicKeyBase64, IPAddress ip)
+    private (X509Certificate2 Certificate, string Address) Issue(string name, string machineGuid, string publicKeyBase64, IPAddress ip)
     {
         var publicKey = PublicKey.CreateFromSubjectPublicKeyInfo(Convert.FromBase64String(publicKeyBase64), out _);
 
@@ -292,15 +372,16 @@ public sealed partial class CentralAuthService(AuthPaths paths)
         // someone taking the address of a computer that is off): viewers must not trust a stranger at that address.
         string address = AuthData.Display(ip);
         var holder = ComputerStore.Load(paths).Computers.FirstOrDefault(c =>
-            !c.Revoked && !c.Same(name, machineGuid) && c.LastAddress == address &&
+            !c.Revoked && !c.Same(name, machineGuid) && c.CertificateAddress == address &&
             c.LastSeenUtc > DateTime.UtcNow - CentralProtocol.ComputerCertificateLifetime - TimeSpan.FromDays(1));
         IPAddress[] ips = holder is null ? [ip] : [];
         if (holder is not null)
             AuditLine($"ADDRESS-IN-USE  {name}: {address} was used by {holder.Name}; certificate issued for the name only");
 
         using var ca = CertificateManager.LoadProtected(paths.CaKeyFile);
-        return CertificateManager.IssueCertificate(ca, publicKey, name, [name, name + ".local"], ips, clientAuth: true,
+        var cert = CertificateManager.IssueCertificate(ca, publicKey, name, [name, name + ".local"], ips, clientAuth: true,
             CentralProtocol.ComputerCertificateLifetime);
+        return (cert, holder is null ? address : "");
     }
 
     private void AuditLine(string line)
@@ -315,7 +396,7 @@ public sealed partial class CentralAuthService(AuthPaths paths)
         {
             if (_creds is null || DateTime.UtcNow - _credsCheckedUtc > TimeSpan.FromMinutes(1))
             {
-                _creds = CertificateManager.EnsureLeaf(paths.CaKeyFile, paths.TlsCertFile, Log.Info);
+                _creds = CertificateManager.EnsureLeaf(paths.CaKeyFile, paths.TlsCertFile, Log.Info, extraEku: Tickets.AuthServerEkuOid);
                 _credsCheckedUtc = DateTime.UtcNow;
             }
             return _creds;

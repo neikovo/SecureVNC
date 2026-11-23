@@ -17,6 +17,7 @@ internal sealed class ConnectForm : Form
     private readonly Button _connect = new() { Text = "Connect", AutoSize = true };
     private readonly Button _import = new() { Text = "Import CA...", AutoSize = true };
     private readonly Label _status = new() { AutoSize = true, ForeColor = Color.DimGray };
+    private readonly CheckBox _emergency = new() { Text = "Emergency login (local account on that computer, not the auth server)", AutoSize = true };
 
     private sealed record Settings(string Host, int Port, string User);
 
@@ -42,6 +43,8 @@ internal sealed class ConnectForm : Form
         Row("User:", _user);
         Row("Password:", _password);
         Row("Google Authenticator code:", _code);
+        grid.Controls.Add(_emergency);
+        grid.SetColumnSpan(_emergency, 2);
 
         var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill };
         buttons.Controls.Add(_connect);
@@ -63,7 +66,7 @@ internal sealed class ConnectForm : Form
 
     private async Task ConnectAsync()
     {
-        var options = new ConnectOptions(_host.Text.Trim(), (int)_port.Value, _user.Text.Trim(), _password.Text, _code.Text.Trim());
+        var options = new ConnectOptions(_host.Text.Trim(), (int)_port.Value, _user.Text.Trim(), _password.Text, _code.Text.Trim(), _emergency.Checked);
         if (options.Host.Length == 0 || options.User.Length == 0)
         {
             _status.Text = "Enter the computer and the user name.";
@@ -151,7 +154,7 @@ internal sealed class ConnectForm : Form
 
     private void SetBusy(bool busy, string? status)
     {
-        foreach (Control c in new Control[] { _host, _port, _user, _password, _code, _connect, _import }) c.Enabled = !busy;
+        foreach (Control c in new Control[] { _host, _port, _user, _password, _code, _emergency, _connect, _import }) c.Enabled = !busy;
         if (status is not null) _status.Text = status;
         UseWaitCursor = busy;
     }

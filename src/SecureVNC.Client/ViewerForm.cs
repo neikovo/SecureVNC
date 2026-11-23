@@ -39,7 +39,7 @@ internal sealed class ViewerForm : Form
         bar.Items.Add("Ctrl+Shift+Esc", null, (_, _) => _view.SendCombo(Ctrl, Shift, Esc));
         bar.Items.Add(new ToolStripSeparator());
         bar.Items.Add("Disconnect", null, (_, _) => Close());
-        bar.Items.Add(new ToolStripLabel($"{user}@{host}  ·  {client.TlsInfo}  ·  MFA")
+        bar.Items.Add(new ToolStripLabel($"{user}@{host}  ·  {client.TlsInfo}  ·  MFA, {client.LoginMethod}")
         {
             Alignment = ToolStripItemAlignment.Right,
             ForeColor = Color.DarkGreen,
