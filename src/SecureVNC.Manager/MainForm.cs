@@ -16,10 +16,15 @@ internal sealed class MainForm : Form
     private readonly ListView _users = new() { View = View.Details, FullRowSelect = true, MultiSelect = false, Width = 620, Height = 200, HideSelection = false };
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 3000 };
 
-    public MainForm(bool firstRun)
+    /// <summary>Closes itself after this much inactivity; reopening asks for the login again.</summary>
+    private static readonly TimeSpan IdleClose = TimeSpan.FromMinutes(10);
+    private DateTime _lastActivity = DateTime.UtcNow;
+
+    public MainForm(bool firstRun, string? user)
     {
         _firstRun = firstRun;
-        Text = "SecureVNC Manager";
+        Text = user is null ? "SecureVNC Manager" : $"SecureVNC Manager - {user}";
+        Application.AddMessageFilter(new ActivityFilter(() => _lastActivity = DateTime.UtcNow));
         Icon = SystemIcons.Shield;
         AutoScaleMode = AutoScaleMode.Dpi;
         AutoSize = true;
@@ -58,7 +63,16 @@ internal sealed class MainForm : Form
         root.Controls.Add(users.Parent!);
 
         Controls.Add(root);
-        _timer.Tick += (_, _) => RefreshService();
+        _timer.Tick += (_, _) =>
+        {
+            RefreshService();
+            if (DateTime.UtcNow - _lastActivity > IdleClose)
+            {
+                Log.Info("Manager closed after inactivity");
+                _timer.Stop();
+                Application.Exit();   // also closes open dialogs
+            }
+        };
         _timer.Start();
         RefreshAll();
     }
@@ -212,6 +226,16 @@ internal sealed class MainForm : Form
         {
             UseWaitCursor = false;
             RefreshService();
+        }
+    }
+
+    /// <summary>Any key or mouse use in the Manager counts as activity.</summary>
+    private sealed class ActivityFilter(Action touch) : IMessageFilter
+    {
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg is 0x0100 or 0x0104 or 0x0200 or 0x0201 or 0x0204 or 0x020A) touch();   // key, mouse move/click/wheel
+            return false;
         }
     }
 }

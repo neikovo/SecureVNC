@@ -10,8 +10,7 @@ namespace SecureVNC.Client;
 /// </summary>
 public sealed class TrustStore
 {
-    private static string Dir { get; set; } =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SecureVNC");
+    private static string Dir { get; set; } = ClientPaths.DataDir;
     private static string FilePath => Path.Combine(Dir, "trust.json");
 
     /// <summary>For the self-test only.</summary>

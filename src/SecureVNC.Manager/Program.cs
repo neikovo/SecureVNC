@@ -36,6 +36,15 @@ internal static class Program
             return;
         }
 
-        Application.Run(new MainForm(firstRun: args.Contains("--first-run")));
+        // Once a user exists, the Manager opens only with a SecureVNC login (password + authenticator code).
+        string? user = null;
+        if (UserStore.Load().Users.Count > 0)
+        {
+            using var login = new LoginDialog("Unlock SecureVNC Manager with a SecureVNC user: password and the code from Google Authenticator.");
+            if (login.ShowDialog() != DialogResult.OK) return;
+            user = login.UserName;
+        }
+
+        Application.Run(new MainForm(firstRun: args.Contains("--first-run"), user));
     }
 }

@@ -7,8 +7,7 @@ namespace SecureVNC.Client;
 
 internal sealed class ConnectForm : Form
 {
-    private static readonly string SettingsFile = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SecureVNC", "client.json");
+    private static readonly string SettingsFile = Path.Combine(ClientPaths.DataDir, "client.json");
 
     private readonly TextBox _host = new() { Width = 240 };
     private readonly NumericUpDown _port = new() { Minimum = 1, Maximum = 65535, Value = Rfb.DefaultPort, Width = 90 };
@@ -23,7 +22,7 @@ internal sealed class ConnectForm : Form
 
     public ConnectForm()
     {
-        Text = "SecureVNC";
+        Text = ClientPaths.IsPortable ? "SecureVNC (portable)" : "SecureVNC";
         Icon = SystemIcons.Shield;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
