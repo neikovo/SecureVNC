@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using QRCoder;
+using SecureVNC.Shared.Central;
 using SecureVNC.Shared.Hosting;
 using SecureVNC.Shared.Security;
 
@@ -30,6 +31,9 @@ internal static class Program
                 ["cert", "show"] => CertShow(),
                 ["cert", "renew"] => CertRenew(),
                 ["export-ca", _] => ExportCa(args[1]),
+                ["join", _, _, _] => Join(args[1], args[2], args[3]),
+                ["leave"] => Leave(),
+                ["status"] => Status(),
                 _ => Usage(),
             };
         }
@@ -54,6 +58,10 @@ internal static class Program
               cert show                show CA fingerprint and server certificate
               cert renew               re-issue the server certificate now
               export-ca <file.cer>     export the CA certificate for clients
+              join <server> <ca-fingerprint> <join-key>
+                                       use a SecureVNC Auth Server for logins (central mode)
+              leave                    back to local users (new local CA)
+              status                   local or central mode, auth server reachable?
             """);
         return 2;
     }
@@ -67,6 +75,8 @@ internal static class Program
     {
         if (ServerPaths.IsInitialized && !force)
         {
+            try { MachineIdentity.Guard(Console.WriteLine); }
+            catch (Exception ex) { Console.WriteLine($"Warning: {ex.Message}"); }
             Console.WriteLine($"Already initialized ({ServerPaths.DataDir}). Use --force to create a new CA.");
             Console.WriteLine("Warning: a new CA makes every client ask to trust the server again.");
             return CertShow();
@@ -74,6 +84,11 @@ internal static class Program
 
         ServerPaths.EnsureDataDir();
         if (!File.Exists(ServerPaths.ConfigFile)) new ServerConfig().Save();
+        if (ServerConfig.Load().IsCentral)
+        {
+            Console.WriteLine("This computer uses an auth server (central mode). Use 'leave' first to go back to a local CA.");
+            return 1;
+        }
         using var ca = CertificateManager.InitializePki(force: true);
         Console.WriteLine($"Data folder:   {ServerPaths.DataDir}");
         Console.WriteLine($"CA:            {ca.Subject}");
@@ -181,6 +196,46 @@ internal static class Program
         File.Copy(ServerPaths.CaCertFile, path, overwrite: true);
         Console.WriteLine($"CA certificate written to {Path.GetFullPath(path)} (public, safe to copy to clients).");
         return 0;
+    }
+
+    private static int Join(string server, string fingerprint, string joinKey)
+    {
+        RequireInit();
+        CentralClient.Join(server, fingerprint, joinKey, Console.WriteLine);
+        Console.WriteLine("Restart the SecureVNC service to use it now: Restart-Service SecureVNC");
+        return 0;
+    }
+
+    private static int Leave()
+    {
+        RequireInit();
+        CentralClient.Leave();
+        Console.WriteLine("Local mode: only local users can log in. Add one with: SecureVNC.Admin user add <name>");
+        Console.WriteLine("Restart the SecureVNC service: Restart-Service SecureVNC");
+        return 0;
+    }
+
+    private static int Status()
+    {
+        RequireInit();
+        var config = ServerConfig.Load();
+        if (!config.IsCentral)
+        {
+            Console.WriteLine($"Local mode: {UserStore.Load().Users.Count} local user(s).");
+            return 0;
+        }
+        Console.WriteLine($"Central mode: auth server {config.AuthServer}");
+        try
+        {
+            var r = CentralClient.Ping(config);
+            Console.WriteLine(r.Ok ? $"Reachable, registered as {r.MachineName}." : $"Auth server says: {r.Error}");
+            return r.Ok ? 0 : 1;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"NOT reachable: {ex.Message}");
+            return 1;
+        }
     }
 
     // ---- helpers ----

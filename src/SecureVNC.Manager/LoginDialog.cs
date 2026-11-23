@@ -13,10 +13,13 @@ internal sealed class LoginDialog : Form
     private readonly TextBox _password = new() { Width = 240, UseSystemPasswordChar = true };
     private readonly TextBox _code = new() { Width = 120, MaxLength = 7, Font = new Font("Consolas", 14f) };
     private readonly Label _error = new() { AutoSize = true, ForeColor = Color.Firebrick, MaximumSize = new Size(420, 0) };
+    private readonly Func<string, string, string, string?> _verify;
     private int _failures;
 
-    public LoginDialog(string reason)
+    /// <param name="verify">user, password, code -> null when accepted, otherwise the message to show.</param>
+    public LoginDialog(string reason, Func<string, string, string, string?> verify)
     {
+        _verify = verify;
         Text = "SecureVNC Manager - locked";
         Icon = SystemIcons.Shield;
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -65,20 +68,20 @@ internal sealed class LoginDialog : Form
     {
         var name = _name.Text.Trim();
         UseWaitCursor = true;
-        bool ok;
+        string? problem;
         try
         {
-            ok = UserStore.Authenticate(name, _password.Text, _code.Text.Replace(" ", ""));
+            problem = _verify(name, _password.Text, _code.Text.Replace(" ", ""));
         }
         finally
         {
             UseWaitCursor = false;
         }
 
-        if (ok)
+        if (problem is null)
         {
             Log.Info($"Manager unlocked by '{name}'");
-            UserName = UserStore.Load().Find(name)?.Name ?? name;
+            UserName = name;
             DialogResult = DialogResult.OK;
             return;
         }
@@ -94,7 +97,7 @@ internal sealed class LoginDialog : Form
             return;
         }
         Thread.Sleep(1000 * _failures);   // slows down guessing
-        _error.Text = "Wrong user name, password or code. A code can be used only once: wait for the next one.";
+        _error.Text = problem;
         _password.Focus();
     }
 }

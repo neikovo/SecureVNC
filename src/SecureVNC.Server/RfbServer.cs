@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using SecureVNC.Shared.Hosting;
+using SecureVNC.Shared.Security;
 
 namespace SecureVNC.Server;
 

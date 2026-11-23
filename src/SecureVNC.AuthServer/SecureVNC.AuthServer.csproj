@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>SecureVNC.AuthServer</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
+    <ProjectReference Include="..\SecureVNC.Shared\SecureVNC.Shared.csproj" />
+  </ItemGroup>
+
+</Project>

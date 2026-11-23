@@ -20,6 +20,8 @@ public sealed partial class UserStore
 {
     private static readonly object FileLock = new();
 
+    private string _file = ServerPaths.UsersFile;
+
     public List<UserRecord> Users { get; set; } = [];
 
     [GeneratedRegex("^[A-Za-z0-9._-]{1,32}$")]
@@ -37,13 +39,17 @@ public sealed partial class UserStore
         return null;
     }
 
-    public static UserStore Load()
+    public static UserStore Load() => Load(ServerPaths.UsersFile);
+
+    public static UserStore Load(string file)
     {
         lock (FileLock)
         {
-            return File.Exists(ServerPaths.UsersFile)
-                ? JsonSerializer.Deserialize<UserStore>(File.ReadAllText(ServerPaths.UsersFile), ServerConfig.Json) ?? new()
+            var store = File.Exists(file)
+                ? JsonSerializer.Deserialize<UserStore>(File.ReadAllText(file), ServerConfig.Json) ?? new()
                 : new();
+            store._file = file;
+            return store;
         }
     }
 
@@ -51,9 +57,9 @@ public sealed partial class UserStore
     {
         lock (FileLock)
         {
-            var tmp = ServerPaths.UsersFile + ".tmp";
+            var tmp = _file + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(this, ServerConfig.Json));
-            File.Move(tmp, ServerPaths.UsersFile, overwrite: true);
+            File.Move(tmp, _file, overwrite: true);
         }
     }
 
@@ -73,11 +79,14 @@ public sealed partial class UserStore
     /// Verifies password + TOTP. Re-reads the file each time so changes made by
     /// SecureVNC.Admin apply without restarting the server.
     /// </summary>
-    public static bool Authenticate(string name, string password, string code)
+    public static bool Authenticate(string name, string password, string code) =>
+        Authenticate(ServerPaths.UsersFile, name, password, code);
+
+    public static bool Authenticate(string file, string name, string password, string code)
     {
         lock (FileLock)
         {
-            var store = Load();
+            var store = Load(file);
             var user = store.Find(name);
             if (user is null)
             {

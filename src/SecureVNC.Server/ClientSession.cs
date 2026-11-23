@@ -5,8 +5,10 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Text;
+using SecureVNC.Shared.Central;
 using SecureVNC.Shared.Hosting;
 using SecureVNC.Shared.Protocol;
+using SecureVNC.Shared.Security;
 
 namespace SecureVNC.Server;
 
@@ -113,14 +115,25 @@ internal sealed class ClientSession(
         var code = Encoding.ASCII.GetString(r.ReadBytes(Rfb.TotpCodeLength));
 
         string userKey = $"user:{user.ToLowerInvariant()}";
-        bool ok = !throttle.IsLocked(userKey) && UserStore.Authenticate(user, password, code);
-        if (!ok)
+        var result = throttle.IsLocked(userKey)
+            ? LoginResult.Failed
+            : LoginVerifier.Verify(user, password, code, NetworkInfo.Display(remote));
+        if (result != LoginResult.Ok)
         {
-            throttle.Fail(ipKey);
-            throttle.Fail(userKey);
-            Log.Info($"{remote}: failed login for '{user}'");
-            Thread.Sleep(1000);
-            Send(w.Reset().U32(Rfb.SecurityResultFailed).LengthPrefixedString("Authentication failed."));
+            string message = "Authentication failed.";
+            if (result == LoginResult.Unavailable)
+            {
+                message = "The SecureVNC authentication server is not reachable. Try again later.";
+                Log.Info($"{remote}: login for '{user}' not possible: auth server unreachable");
+            }
+            else
+            {
+                throttle.Fail(ipKey);
+                throttle.Fail(userKey);
+                Log.Info($"{remote}: failed login for '{user}'");
+                Thread.Sleep(1000);
+            }
+            Send(w.Reset().U32(Rfb.SecurityResultFailed).LengthPrefixedString(message));
             return false;
         }
         throttle.Success(ipKey);

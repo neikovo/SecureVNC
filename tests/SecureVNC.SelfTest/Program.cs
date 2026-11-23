@@ -1,7 +1,9 @@
 using System.Security.Authentication;
 using System.Text;
 using SecureVNC.Client;
+using SecureVNC.AuthServer;
 using SecureVNC.Server;
+using SecureVNC.Shared.Central;
 using SecureVNC.Shared.Hosting;
 using SecureVNC.Shared.Security;
 
@@ -136,6 +138,66 @@ err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "tester
 Check(err is AuthenticationException && err.Message.Contains("Too many"), $"lockout after failed attempts ({err?.Message})");
 
 server.Stop();
+Thread.Sleep(300);
+
+// ===== Central mode: SecureVNC Auth Server decides, the computer only asks =====
+var authPaths = new AuthPaths(Path.Combine(temp, "auth"));
+AuthData.Initialize(authPaths, _ => { });
+var authConfig = AuthConfig.Load(authPaths);
+authConfig.Port = 15902;
+authConfig.Save(authPaths);
+var adminSecret = Totp.NewSecret();
+var admins = UserStore.Load(authPaths.UsersFile);
+admins.Users.Add(UserStore.CreateRecord("central", password, adminSecret, acceptedStep: 0));
+admins.Save();
+var auth = new CentralAuthService(authPaths);
+auth.Start("127.0.0.1");
+string fingerprint = AuthData.CaFingerprint(authPaths), joinKey = AuthData.ReadJoinKey(authPaths);
+const string authAddress = "127.0.0.1:15902";
+
+err = Try(() => CentralClient.Join(authAddress, new string('A', 64), joinKey, _ => { }));
+Check(err is not null, $"join refuses an auth server with another CA fingerprint ({err?.Message})");
+err = Try(() => CentralClient.Join(authAddress, fingerprint, "AAAA-BBBB-CCCC-DDDD-EEEE-FFFF", _ => { }));
+Check(err?.Message.Contains("Wrong join key") == true, $"join refused with a wrong join key ({err?.Message})");
+err = Try(() => CentralClient.Join(authAddress, fingerprint, joinKey, _ => { }));
+Check(err is null && ServerConfig.Load().IsCentral && !File.Exists(ServerPaths.CaKeyFile), $"computer joined the auth server {err?.Message}");
+File.Delete(ServerPaths.UsersFile);   // no local emergency users
+
+server = new RfbServer(config);
+server.Start();
+string CentralCode(int offset) => Totp.Compute(adminSecret, Totp.CurrentStep(DateTimeOffset.UtcNow) + offset);
+var centralCode0 = CentralCode(0);
+err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, centralCode0), TrustStore.Load(), Trust).Dispose());
+Check(err is null, $"central login (password + TOTP checked by the auth server) {err?.Message}");
+err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, centralCode0), TrustStore.Load(), Trust).Dispose());
+Check(err is AuthenticationException, $"central: reused code rejected ({err?.Message})");
+err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "tester", password, Code(1)), TrustStore.Load(), Trust).Dispose());
+Check(err is AuthenticationException, $"central: local-only user rejected ({err?.Message})");
+Check(AuthData.RecentAudit(authPaths, 20).Any(l => l.Contains("LOGIN  user 'central'")), "auth server audit log has the login");
+
+ComputerStore.Update(authPaths, s => s.Computers[0].Revoked = true);
+err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, CentralCode(1)), TrustStore.Load(), Trust).Dispose());
+Check(err is AuthenticationException, $"central: removed computer cannot log anyone in ({err?.Message})");
+ComputerStore.Update(authPaths, s => s.Computers[0].Revoked = false);
+
+auth.Stop();
+Thread.Sleep(300);
+err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, CentralCode(1)), TrustStore.Load(), Trust).Dispose());
+Check(err is AuthenticationException && err.Message.Contains("not reachable"), $"central: auth server down -> nobody logs in ({err?.Message})");
+
+// A clone: the saved identity is another computer's -> joins again with the saved join key.
+auth = new CentralAuthService(authPaths);
+auth.Start("127.0.0.1");
+File.WriteAllText(ServerPaths.IdentityFile, """{"machineGuid":"00000000-0000-0000-0000-000000000000","machineName":"ORIGINAL-PC"}""");
+bool rejoined = false;
+err = Try(() => rejoined = MachineIdentity.Guard(_ => { }));
+Check(err is null && rejoined && MachineIdentity.Saved is { } id && MachineIdentity.Matches(id, MachineIdentity.Current),
+    $"cloned computer joins again by itself {err?.Message}");
+err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, CentralCode(1)), TrustStore.Load(), Trust).Dispose());
+Check(err is null, $"central login after re-join {err?.Message}");
+
+server.Stop();
+auth.Stop();
 Thread.Sleep(300);
 if (failures == 0)
 {

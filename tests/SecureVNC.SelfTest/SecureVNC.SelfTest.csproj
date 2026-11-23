@@ -13,6 +13,7 @@
     <ProjectReference Include="..\..\src\SecureVNC.Shared\SecureVNC.Shared.csproj" />
     <ProjectReference Include="..\..\src\SecureVNC.Server\SecureVNC.Server.csproj" />
     <ProjectReference Include="..\..\src\SecureVNC.Client\SecureVNC.Client.csproj" />
+    <ProjectReference Include="..\..\src\SecureVNC.AuthServer\SecureVNC.AuthServer.csproj" />
   </ItemGroup>
 
 </Project>

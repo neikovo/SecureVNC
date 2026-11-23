@@ -25,7 +25,16 @@ public sealed class ServerConfig
     public int LockoutMinutes { get; set; } = 5;
     public int MaxFramesPerSecond { get; set; } = 30;
 
-    internal static readonly JsonSerializerOptions Json = new()
+    /// <summary>Central mode: "host" or "host:port" of the SecureVNC Auth Server. Empty = local users only.</summary>
+    public string? AuthServer { get; set; }
+
+    /// <summary>SHA-256 fingerprint of the auth server's CA: the only auth server this computer trusts.</summary>
+    public string? AuthServerFingerprint { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool IsCentral => !string.IsNullOrWhiteSpace(AuthServer);
+
+    public static readonly JsonSerializerOptions Json = new()
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,

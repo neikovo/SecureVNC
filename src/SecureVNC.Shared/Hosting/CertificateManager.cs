@@ -4,6 +4,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using SecureVNC.Shared.Central;
 using SecureVNC.Shared.Security;
 
 namespace SecureVNC.Shared.Hosting;
@@ -14,21 +15,23 @@ public sealed record ServerCredentials(
     SslStreamCertificateContext Context);
 
 /// <summary>
-/// Local PKI: each server has its own CA ("SecureVNC CA &lt;machine&gt;") that signs a
-/// short-lived TLS certificate for the machine's current names and IPv4 addresses.
-/// Clients trust the CA, so the leaf can be re-issued whenever the IP changes.
+/// Local mode: each server has its own CA ("SecureVNC CA &lt;machine&gt;") that signs a TLS certificate for the
+/// machine's current names and IPv4 addresses; the leaf is re-issued whenever the IP changes.
+/// Central mode: the certificate comes from the SecureVNC Auth Server (organization CA), see <see cref="CentralClient"/>.
+/// Clients trust the CA, never a single leaf.
 /// </summary>
 public static class CertificateManager
 {
     private const string ServerAuthOid = "1.3.6.1.5.5.7.3.1";
+    private const string ClientAuthOid = "1.3.6.1.5.5.7.3.2";
     private const string SanOid = "2.5.29.17";
 
-    public static X509Certificate2 CreateCa()
+    public static X509Certificate2 CreateCa() => CreateCa($"SecureVNC CA {Environment.MachineName}");
+
+    public static X509Certificate2 CreateCa(string commonName)
     {
         using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var req = new CertificateRequest(
-            new X500DistinguishedName($"CN=SecureVNC CA {Environment.MachineName}, O=SecureVNC"),
-            key, HashAlgorithmName.SHA256);
+        var req = new CertificateRequest(new X500DistinguishedName($"CN={commonName}, O=SecureVNC"), key, HashAlgorithmName.SHA256);
         req.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, true, 0, true));
         req.CertificateExtensions.Add(new X509KeyUsageExtension(
             X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
@@ -37,16 +40,17 @@ public static class CertificateManager
         return req.CreateSelfSigned(now.AddDays(-1), now.AddYears(10));
     }
 
-    public static X509Certificate2 IssueServerCertificate(
-        X509Certificate2 ca, IReadOnlyCollection<string> dnsNames, IReadOnlyCollection<IPAddress> ips)
+    /// <summary>Signs a certificate for a public key (generated elsewhere, e.g. on a computer joining the auth server).</summary>
+    public static X509Certificate2 IssueCertificate(
+        X509Certificate2 ca, PublicKey publicKey, string commonName,
+        IEnumerable<string> dnsNames, IEnumerable<IPAddress> ips, bool clientAuth)
     {
-        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-        var req = new CertificateRequest(
-            new X500DistinguishedName($"CN={Environment.MachineName}, O=SecureVNC"),
-            key, HashAlgorithmName.SHA256);
+        var req = new CertificateRequest(new X500DistinguishedName($"CN={commonName}, O=SecureVNC"), publicKey, HashAlgorithmName.SHA256);
         req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
         req.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, true));
-        req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension([new Oid(ServerAuthOid)], false));
+        var eku = new OidCollection { new Oid(ServerAuthOid) };
+        if (clientAuth) eku.Add(new Oid(ClientAuthOid));
+        req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(eku, false));
         var san = new SubjectAlternativeNameBuilder();
         foreach (var d in dnsNames) san.AddDnsName(d);
         foreach (var ip in ips) san.AddIpAddress(ip);
@@ -59,8 +63,15 @@ public static class CertificateManager
         if (notAfter > ca.NotAfter.AddDays(-1)) notAfter = ca.NotAfter.AddDays(-1);
         var serial = RandomNumberGenerator.GetBytes(16);
         serial[0] &= 0x7F;
+        return req.Create(ca, notBefore, notAfter, serial);
+    }
 
-        using var cert = req.Create(ca, notBefore, notAfter, serial);
+    public static X509Certificate2 IssueServerCertificate(
+        X509Certificate2 ca, IReadOnlyCollection<string> dnsNames, IReadOnlyCollection<IPAddress> ips)
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var publicKey = PublicKey.CreateFromSubjectPublicKeyInfo(key.ExportSubjectPublicKeyInfo(), out _);
+        using var cert = IssueCertificate(ca, publicKey, Environment.MachineName, dnsNames, ips, clientAuth: false);
         return cert.CopyWithPrivateKey(key);
     }
 
@@ -88,6 +99,12 @@ public static class CertificateManager
         return (dns.ToList(), ips.Select(IPAddress.Parse).ToList());
     }
 
+    public static IReadOnlyList<IPAddress> SanAddresses(X509Certificate2 cert)
+    {
+        var ext = cert.Extensions.Cast<X509Extension>().FirstOrDefault(e => e.Oid?.Value == SanOid);
+        return ext is null ? [] : new X509SubjectAlternativeNameExtension(ext.RawData).EnumerateIPAddresses().ToList();
+    }
+
     public static bool Covers(X509Certificate2 cert, IEnumerable<string> dns, IEnumerable<IPAddress> ips)
     {
         var ext = cert.Extensions.Cast<X509Extension>().FirstOrDefault(e => e.Oid?.Value == SanOid);
@@ -107,7 +124,7 @@ public static class CertificateManager
     public static string Fingerprint(X509Certificate2 cert) =>
         string.Join(":", cert.GetCertHash(HashAlgorithmName.SHA256).Select(b => b.ToString("X2")));
 
-    /// <summary>Creates the CA (if missing) and a server certificate; used by "SecureVNC.Admin init".</summary>
+    /// <summary>Local mode: creates the CA (if missing) and a server certificate; used by "SecureVNC.Admin init".</summary>
     public static X509Certificate2 InitializePki(bool force)
     {
         if (!force && ServerPaths.IsInitialized) return LoadPublicCa();
@@ -116,30 +133,38 @@ public static class CertificateManager
         File.WriteAllBytes(ServerPaths.CaCertFile, ca.Export(X509ContentType.Cert));
         if (File.Exists(ServerPaths.ServerCertFile)) File.Delete(ServerPaths.ServerCertFile);
         EnsureServerCredentials(_ => { }).ServerCertificate.Dispose();
+        MachineIdentity.SaveCurrent();
         return LoadPublicCa();
     }
 
     public static X509Certificate2 LoadPublicCa() => new(File.ReadAllBytes(ServerPaths.CaCertFile));
 
     /// <summary>
-    /// Loads the server certificate, re-issuing it from the CA when it is missing, expiring,
-    /// or no longer covers the current host names / IP addresses.
+    /// Loads the server certificate. Local mode: re-issues it from the own CA when it is missing, expiring, or no
+    /// longer covers the current host names / IP addresses. Central mode: renews it at the auth server.
     /// </summary>
     public static ServerCredentials EnsureServerCredentials(Action<string> log, bool forceReissue = false)
     {
-        using var ca = LoadProtected(ServerPaths.CaKeyFile);
+        if (ServerConfig.Load() is { IsCentral: true } config)
+            return CentralClient.EnsureCredentials(config, log, forceReissue);
+        return EnsureLeaf(ServerPaths.CaKeyFile, ServerPaths.ServerCertFile, log, forceReissue);
+    }
+
+    /// <summary>Keeps a TLS certificate, signed by the CA in <paramref name="caKeyFile"/>, valid for this machine.</summary>
+    public static ServerCredentials EnsureLeaf(string caKeyFile, string leafFile, Action<string> log, bool forceReissue = false)
+    {
+        using var ca = LoadProtected(caKeyFile);
         var (dns, ips) = CurrentIdentity();
-        X509Certificate2? server = !forceReissue && File.Exists(ServerPaths.ServerCertFile)
-            ? LoadProtected(ServerPaths.ServerCertFile) : null;
+        X509Certificate2? server = !forceReissue && File.Exists(leafFile) ? LoadProtected(leafFile) : null;
 
         if (server is null || server.NotAfter < DateTime.Now.AddDays(30) ||
             server.Issuer != ca.Subject || !Covers(server, dns, ips))
         {
             server?.Dispose();
             using (var fresh = IssueServerCertificate(ca, dns, ips))
-                SaveProtected(fresh, ServerPaths.ServerCertFile);
+                SaveProtected(fresh, leafFile);
             // Reload from PFX: SChannel cannot use the ephemeral key of a freshly created certificate.
-            server = LoadProtected(ServerPaths.ServerCertFile);
+            server = LoadProtected(leafFile);
             log($"Issued server certificate for {string.Join(", ", dns)}, {string.Join(", ", ips)}");
         }
 

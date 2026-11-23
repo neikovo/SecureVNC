@@ -46,6 +46,16 @@ internal static class Program
             return;
         }
 
+        try
+        {
+            MachineIdentity.Guard(Log.Info);   // cloned or renamed computer: make its own keys first
+        }
+        catch (Exception ex)
+        {
+            Fail($"SecureVNC could not create keys for this computer:\n{ex.Message}");
+            return;
+        }
+
         EventWaitHandle? stopEvent = null;
         if (stopEventName is not null)
         {

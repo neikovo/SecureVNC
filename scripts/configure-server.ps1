@@ -5,8 +5,12 @@
 #  - firewall: the port only from the local subnet
 #  - Windows service "SecureVNC" (automatic, restarts on failure)
 #  - policy SoftwareSASGeneration so the service may send Ctrl+Alt+Del (original value kept and restored)
+#  - optional: join a SecureVNC Auth Server (-AuthServer, -AuthFingerprint, -JoinKey): logins are then checked there
 param(
     [int]$Port = 0,          # 0 = keep the configured port (5901 on a new install)
+    [string]$AuthServer = '',
+    [string]$AuthFingerprint = '',
+    [string]$JoinKey = '',
     [switch]$Remove
 )
 $ErrorActionPreference = 'Stop'
@@ -49,6 +53,11 @@ Stop-SecureVnc
 & $admin init --no-user | Out-Host
 if ($LASTEXITCODE) { throw "SecureVNC.Admin init failed ($LASTEXITCODE)" }
 
+if ($AuthServer) {
+    & $admin join $AuthServer $AuthFingerprint $JoinKey | Out-Host
+    if ($LASTEXITCODE) { Write-Warning 'Joining the auth server failed: do it later in SecureVNC Manager.'; $joinFailed = $true }
+}
+
 $configFile = Join-Path $data 'config.json'
 $config = Get-Content $configFile -Raw | ConvertFrom-Json
 if ($Port -gt 0 -and $config.port -ne $Port) {
@@ -86,5 +95,6 @@ if ($public) {
     Write-Warning "Network '$($public.Name -join ', ')' is set to Public: SecureVNC is blocked there. Set it to Private in Windows Settings if this is your home/office LAN."
     exit 10   # the setup program shows this hint
 }
+if ($joinFailed) { exit 11 }
 Write-Host "SecureVNC service running, port $Port."
 exit 0

@@ -1,5 +1,6 @@
 # Builds self-contained packages (no .NET needed on the target PCs):
 #   dist\Server  -> files for the PC that will be controlled (packed by build-installer.ps1, or install-server.ps1)
+#   dist\Auth    -> SecureVNC Auth Server + Auth Console (central administrators, Windows Server)
 #   dist\Client  -> SecureVNC.Client.exe, runs from anywhere
 #   dist\SecureVNC-Client-Portable.zip -> client for a USB stick, keeps its data next to the exe
 param([string]$Out = (Join-Path $PSScriptRoot '..\dist'))
@@ -13,6 +14,11 @@ foreach ($project in 'Server', 'Admin', 'Service', 'Manager') {
     dotnet publish "$root\src\SecureVNC.$project" @common -o "$Out\Server"
     if ($LASTEXITCODE) { throw "$project publish failed" }
 }
+foreach ($project in 'AuthServer', 'Manager') {
+    dotnet publish "$root\src\SecureVNC.$project" @common -o "$Out\Auth"
+    if ($LASTEXITCODE) { throw "$project (auth) publish failed" }
+}
+Copy-Item "$PSScriptRoot\configure-auth.ps1" "$Out\Auth"
 dotnet publish "$root\src\SecureVNC.Client" @common -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o "$Out\Client"
 if ($LASTEXITCODE) { throw 'Client publish failed' }
 

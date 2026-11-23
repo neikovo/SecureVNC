@@ -1,7 +1,7 @@
-namespace SecureVNC.Server;
+namespace SecureVNC.Shared.Security;
 
 /// <summary>Locks out an IP address or user name after too many failed logins.</summary>
-internal sealed class AuthThrottle(int maxFailures, TimeSpan lockout)
+public sealed class AuthThrottle(int maxFailures, TimeSpan lockout)
 {
     private readonly Dictionary<string, (int Fails, DateTime Until)> _state = [];
 
