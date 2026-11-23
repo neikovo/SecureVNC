@@ -4,6 +4,21 @@ Planned work, in the intended order. Nothing here is implemented yet.
 
 ## Features
 
+### 0. "Request help" from the tray icon
+For colleagues who find computers hard: they ask for help with one click, the administrator's viewer shows it.
+
+- **On the controlled computer:** right-click or double-click the tray icon → **Request help**, optional one-line description, **Send**, confirmation "An administrator will connect". The window runs as SYSTEM, so it has a text field only (no file dialogs, no links).
+- **In the viewer:** can stay in the tray and listen; a notification "PC-05 (ivan) asks for help: …" with a **Connect** button, plus a list of recent requests.
+- **Security (the request is a notice, never access):**
+  - the request is **signed with the computer's certificate key** (computer name, Windows user, address, time, text);
+  - the viewer shows it only if the certificate chains to a trusted CA (organization CA or pinned), the name matches, and it is fresh (about 2 minutes) and not a repeat;
+  - **Connect** goes to the computer named in the certificate, never to an address taken from the message;
+  - logging in is unchanged (password + code + ticket). Fake requests are impossible without the computer's key, and even a fake one could not reveal a password;
+  - rate limit per computer against spam.
+- **Phase A (first):** signed UDP broadcast on the local network. Works in local and central mode; same network only; the viewer needs an inbound UDP firewall rule.
+- **Phase B (with WireGuard, item 3):** requests delivered through the Auth Server over the computer's authenticated connection. Works across subnets and VPN, keeps a queue while viewers are off, every request in the audit; the viewer logs in to an administrator "inbox".
+- Size: phase A medium; phase B medium to large.
+
 ### 1. Monitor selection
 - Today the viewer shows the whole desktop (all monitors together).
 - Viewer menu: **Monitor 1 / Monitor 2 / … / All**; mouse input mapped to the chosen monitor.
