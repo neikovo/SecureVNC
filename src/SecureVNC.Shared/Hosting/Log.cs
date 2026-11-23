@@ -7,6 +7,9 @@ public static partial class Log
 
     public static string Source { get; set; } = "server";
 
+    /// <summary>Off when the data folder failed its ownership check: nothing is written into a folder someone else controls.</summary>
+    public static bool Enabled { get; set; } = true;
+
     public static void Info(string message)
     {
         var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} [{Environment.ProcessId}] {OneLine(message)}";
@@ -14,6 +17,9 @@ public static partial class Log
         {
             try
             {
+                if (!Enabled) return;
+                // Never create the data folder itself: setup creates it locked (see ServerPaths.SecureDirectory).
+                if (!Directory.Exists(ServerPaths.DataDir)) return;
                 Directory.CreateDirectory(ServerPaths.LogDir);
                 File.AppendAllText(Path.Combine(ServerPaths.LogDir, $"{Source}-{DateTime.Now:yyyyMMdd}.log"), line + Environment.NewLine);
             }

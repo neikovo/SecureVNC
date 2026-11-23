@@ -12,6 +12,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="SecureVNC.SelfTest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\SecureVNC.Shared\SecureVNC.Shared.csproj" />
   </ItemGroup>
 

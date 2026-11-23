@@ -118,7 +118,7 @@ public static class AuthData
     /// <summary>First start: organization CA, the auth server's TLS certificate and a join key.</summary>
     public static void Initialize(AuthPaths paths, Action<string> log)
     {
-        ServerPaths.SecureDirectory(paths.DataDir, fresh: !paths.IsInitialized);
+        ServerPaths.SecureDirectory(paths.DataDir);
         if (!File.Exists(paths.ConfigFile)) new AuthConfig().Save(paths);
         if (!File.Exists(paths.CaKeyFile))
         {

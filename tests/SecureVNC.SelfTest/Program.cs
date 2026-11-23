@@ -106,6 +106,71 @@ if (client is not null)
     client.Dispose();
 }
 
+// Attack test: malformed and hostile handshakes from the network must not crash or wedge the server.
+var rnd = new Random(20261123);
+// Own instance with a huge lockout limit, so that the garbage "logins" do not lock 127.0.0.1 for the tests below.
+var fuzzServer = new RfbServer(new ServerConfig { Port = 15903, ListenAddress = "127.0.0.1", MaxFailedAttempts = 1_000_000 });
+fuzzServer.Start();
+int fuzzRuns = 90;
+var fuzzOutcomes = new Dictionary<string, int>();
+var fuzzWatch = System.Diagnostics.Stopwatch.StartNew();
+for (int i = 0; i < fuzzRuns; i++)
+{
+    try
+    {
+        using var t = new System.Net.Sockets.TcpClient();
+        t.Connect("127.0.0.1", 15903);
+        var st = t.GetStream();
+        st.ReadTimeout = st.WriteTimeout = 3000;
+        var junk = new byte[rnd.Next(1, 6000)];
+        rnd.NextBytes(junk);
+        if (i % 3 == 0)
+        {
+            st.Write(junk);   // not even TLS
+            try { st.ReadByte(); } catch (IOException) { }
+        }
+        else
+        {
+            using var ssl = new System.Net.Security.SslStream(st, false, (_, _, _, _) => true);
+            ssl.AuthenticateAsClient("localhost");
+            ssl.ReadExactly(new byte[12]);
+            if (i % 3 == 1)
+            {
+                ssl.Write(junk);   // garbage instead of the version
+                try { ssl.ReadByte(); } catch (IOException) { }
+            }
+            else
+            {
+                ssl.Write(Encoding.ASCII.GetBytes("RFB 003.008\n"));
+                int n = ssl.ReadByte();
+                ssl.ReadExactly(new byte[n]);
+                ssl.WriteByte(0x80);
+                var lenBytes = new byte[4];
+                ssl.ReadExactly(lenBytes);
+                ssl.ReadExactly(new byte[System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(lenBytes)]);
+                junk[0] = (byte)(i % 2 == 0 ? 255 : rnd.Next(1, 64));   // oversized or random user name length
+                ssl.Write(junk);
+                try { while (ssl.ReadByte() >= 0) { } } catch (IOException) { }   // until the server hangs up
+            }
+        }
+    }
+    catch (Exception ex) { fuzzOutcomes[ex.GetType().Name] = fuzzOutcomes.GetValueOrDefault(ex.GetType().Name) + 1; continue; }
+    fuzzOutcomes["closed by server"] = fuzzOutcomes.GetValueOrDefault("closed by server") + 1;
+}
+bool alive;
+using (var probe = new System.Net.Sockets.TcpClient())
+{
+    probe.Connect("127.0.0.1", 15903);
+    using var ssl = new System.Net.Security.SslStream(probe.GetStream(), false, (_, _, _, _) => true);
+    ssl.AuthenticateAsClient("localhost");
+    var v = new byte[12];
+    ssl.ReadExactly(v);
+    alive = Encoding.ASCII.GetString(v) == "RFB 003.008\n";
+}
+fuzzServer.Stop();
+Check(alive && fuzzServer.Sessions.Count == 0,
+    $"attack test: {fuzzRuns} malformed/hostile handshakes, server still answers ({fuzzWatch.Elapsed.TotalSeconds:F1} s; {string.Join(", ", fuzzOutcomes.Select(kv => $"{kv.Key} {kv.Value}"))})");
+
 // 4. Replay of the same code must fail.
 err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "tester", password, code0), TrustStore.Load(), Trust).Dispose());
 Check(err is AuthenticationException, $"reused TOTP code rejected ({err?.Message})");
@@ -279,6 +344,44 @@ Check(err is null && rejoined && MachineIdentity.Saved is { } id && MachineIdent
 err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central2", password,
     Totp.Compute(adminSecret2, Totp.CurrentStep(DateTimeOffset.UtcNow) + 1)), TrustStore.Load(), Trust).Dispose());
 Check(err is null, $"central login after re-join {err?.Message}");
+
+// ----- Second audit -----
+// A: only Administrators / SYSTEM (or a member of Administrators) may own SecureVNC data.
+Check(LocalAdmins.IsTrustedOwner(new System.Security.Principal.SecurityIdentifier("S-1-5-32-544"))
+      && LocalAdmins.IsTrustedOwner(new System.Security.Principal.SecurityIdentifier("S-1-5-18"))
+      && !LocalAdmins.IsTrustedOwner(new System.Security.Principal.SecurityIdentifier("S-1-5-32-545"))
+      && !LocalAdmins.IsTrustedOwner(new System.Security.Principal.SecurityIdentifier("S-1-1-0")),
+    "data folder owner check: Administrators/SYSTEM yes, Users/Everyone no");
+
+// C: with the organization CA imported, a computer with another CA is refused (no password goes to it).
+using (var foreignCa = CertificateManager.CreateCa("Impostor CA"))
+using (var foreignLeaf = CertificateManager.IssueServerCertificate(foreignCa, ["fake-host"], [System.Net.IPAddress.Loopback]))
+using (var foreignCaPublic = new System.Security.Cryptography.X509Certificates.X509Certificate2(foreignCa.RawData))
+{
+    var orgCaFile = Path.Combine(temp, "org-ca.cer");
+    File.Copy(authPaths.CaCertFile, orgCaFile, overwrite: true);
+    var orgTrust = TrustStore.Load();
+    orgTrust.Import(orgCaFile);
+    int asked = 0;
+    err = Try(() => RfbClient.VerifyServer("fake-host", foreignLeaf, foreignCaPublic, orgTrust, (_, _) => { asked++; return true; }));
+    Check(err is AuthenticationException && asked == 0, $"organization CA imported: impostor with its own CA refused without asking ({err?.Message})");
+    err = Try(() => RfbClient.VerifyServer("fake-host", foreignLeaf, foreignCaPublic, orgTrust, (_, _) => { asked++; return true; }, emergency: true));
+    Check(err is null && asked == 1, "with Emergency login the user may still decide (asked once)");
+}
+
+// D: millions of made-up user names cannot fill memory.
+var bounded = new AuthThrottle(5, TimeSpan.FromMinutes(5));
+for (int i = 0; i < 25_000; i++) bounded.Fail($"user:made-up-{i}");
+Check(bounded.TrackedCount <= 10_000, $"lockout memory stays bounded ({bounded.TrackedCount} entries after 25000 names)");
+
+// E: writing a log never creates the data folder (setup creates it locked).
+var realDataDir = ServerPaths.DataDir;
+var missing = Path.Combine(temp, "not-created");
+ServerPaths.UseDataDir(missing);
+Log.Info("test");
+bool created = Directory.Exists(missing);
+ServerPaths.UseDataDir(realDataDir);
+Check(!created, "a log line does not create a missing data folder");
 
 server.Stop();
 auth.Stop();

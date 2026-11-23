@@ -107,7 +107,9 @@ public sealed class RfbClient : IDisposable
             nonce = _r.ReadBytes(Rfb.TicketNonceBytes);
         }
         // The CA this user trusts for the host - never the one the computer merely sent along.
-        var trustedCa = VerifyServer(o.Host, leaf ?? throw new AuthenticationException("No server certificate."), presentedCa, trust, prompt);
+        var trustedCa = VerifyServer(o.Host, leaf ?? throw new AuthenticationException("No server certificate."), presentedCa, trust, prompt, o.Emergency);
+        if (useTicket && !string.Equals(computerName, Tickets.MyRegisteredName(leaf), StringComparison.OrdinalIgnoreCase))
+            throw new AuthenticationException($"The computer calls itself '{computerName}', but its certificate is for '{Tickets.MyRegisteredName(leaf)}'. Not connecting.");
 
         var user = Encoding.UTF8.GetBytes(o.User);
         var pass = Encoding.UTF8.GetBytes(o.Password);
@@ -156,7 +158,8 @@ public sealed class RfbClient : IDisposable
     /// Accepts the server only if its certificate is valid for the typed host name and chains to a CA
     /// this user trusts. A new CA needs the user's OK (fingerprint shown); a changed CA gets a warning.
     /// </summary>
-    private static X509Certificate2 VerifyServer(string host, X509Certificate2 leaf, X509Certificate2 presentedCa, TrustStore trust, TrustPrompt prompt)
+    internal static X509Certificate2 VerifyServer(string host, X509Certificate2 leaf, X509Certificate2 presentedCa, TrustStore trust,
+        TrustPrompt prompt, bool emergency = false)
     {
         if (!leaf.MatchesHostname(host, allowWildcards: false, allowCommonName: false))
             throw new AuthenticationException($"The server certificate is not valid for '{host}'. Use the computer name or its current IP address.");
@@ -171,6 +174,11 @@ public sealed class RfbClient : IDisposable
 
         if (!TrustStore.IsCa(presentedCa) || !TrustStore.ChainsTo(leaf, [presentedCa]))
             throw new AuthenticationException("The server's certificate chain is invalid.");
+        // With your organization's CA imported, a computer with some other CA is not one of yours - unless you say so.
+        if (!emergency && trust.Imported().Any(IsOrganizationCa) && !IsOrganizationCa(presentedCa))
+            throw new AuthenticationException(
+                $"{host} does not have a certificate from your organization's auth server. It may be an impostor: not connecting. " +
+                "(For a computer that really uses local accounts, tick \"Emergency login\".)");
         if (!prompt(presentedCa, caChanged: known is not null))
             throw new OperationCanceledException("Connection cancelled: the server certificate was not trusted.");
         trust.TrustHost(host, presentedCa);

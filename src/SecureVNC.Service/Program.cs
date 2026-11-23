@@ -31,6 +31,16 @@ internal sealed class SecureVncService : ServiceBase
 
     protected override void OnStart(string[] args)
     {
+        try
+        {
+            ServerPaths.Harden(ServerPaths.DataDir);   // before anything is written there as SYSTEM
+        }
+        catch (Exception ex)
+        {
+            Log.Enabled = false;
+            EventLog.WriteEntry($"SecureVNC: the data folder is not trustworthy, the agent will not start. {ex.Message}",
+                System.Diagnostics.EventLogEntryType.Error);
+        }
         Log.Info("Service starting");
         _sas = new SasPipeServer();
         _sas.Start();

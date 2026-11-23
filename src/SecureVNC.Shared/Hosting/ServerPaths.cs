@@ -32,14 +32,15 @@ public static class ServerPaths
     /// <summary>Local mode: own CA key. Central mode: certificate from the auth server.</summary>
     public static bool IsInitialized => File.Exists(CaCertFile) && (File.Exists(CaKeyFile) || File.Exists(ServerCertFile));
 
-    public static void EnsureDataDir() => SecureDirectory(DataDir, fresh: !IsInitialized);
+    public static void EnsureDataDir() => SecureDirectory(DataDir);
 
     /// <summary>
     /// Creates (or re-secures) a data folder: owner Administrators, access only for Administrators and SYSTEM.
-    /// Any user may create folders in %ProgramData%, so a folder that is already there before SecureVNC set it up
-    /// (<paramref name="fresh"/>) may hold planted users, settings or links: it is moved aside, never used.
+    /// Any user may create folders in %ProgramData%. A folder that is not owned by Administrators/SYSTEM was not made
+    /// by SecureVNC and may hold planted users, settings, certificates or links: it is moved aside, never used.
+    /// (Its contents cannot decide this: an ordinary user can create every SecureVNC file, but not this ownership.)
     /// </summary>
-    public static void SecureDirectory(string path, bool fresh)
+    public static void SecureDirectory(string path)
     {
         if (!IsAdministrator())
         {
@@ -48,7 +49,7 @@ public static class ServerPaths
             return;
         }
 
-        if (fresh && Directory.Exists(path))
+        if (Directory.Exists(path) && !LocalAdmins.IsTrustedOwner(LocalAdmins.OwnerOf(new DirectoryInfo(path))))
         {
             var aside = $"{path}.untrusted-{DateTime.Now:yyyyMMdd-HHmmss}";
             try
@@ -58,7 +59,7 @@ public static class ServerPaths
             catch (Exception ex)
             {
                 throw new UnauthorizedAccessException(
-                    $"The folder {path} already existed before SecureVNC was set up and cannot be moved aside ({ex.Message}). " +
+                    $"The folder {path} was not created by an administrator and cannot be moved aside ({ex.Message}). " +
                     "Delete it as administrator and try again.", ex);
             }
         }
@@ -88,6 +89,8 @@ public static class ServerPaths
         var root = new DirectoryInfo(path);
         if (root.Attributes.HasFlag(FileAttributes.ReparsePoint))
             throw new UnauthorizedAccessException($"{path} is a link, not a folder. Delete it and reinstall.");
+        if (!LocalAdmins.IsTrustedOwner(LocalAdmins.OwnerOf(root)))
+            throw new UnauthorizedAccessException($"{path} was not created by an administrator. Not used: run SecureVNC setup again.");
         root.SetAccessControl(LockedDirectorySecurity());
 
         HardenChildren(root, admins);
@@ -103,6 +106,9 @@ public static class ServerPaths
                 entry.Delete();   // removes the link itself, not its target
                 continue;
             }
+            // Something in the folder owned by an ordinary user was planted: refuse rather than adopt it.
+            if (!LocalAdmins.IsTrustedOwner(LocalAdmins.OwnerOf(entry)))
+                throw new UnauthorizedAccessException($"{entry.FullName} was not created by SecureVNC or an administrator. Delete it and run setup again.");
             if (entry is DirectoryInfo sub)
             {
                 var s = new DirectorySecurity();
