@@ -127,11 +127,7 @@ internal sealed class MainForm : Form
         using (var ca = CertificateManager.LoadPublicCa()) _fingerprint.Text = CertificateManager.Fingerprint(ca);
 
         var config = ServerConfig.Load();
-        var addresses = NetworkInterface.GetAllNetworkInterfaces()
-            .Where(n => n.OperationalStatus == OperationalStatus.Up && n.NetworkInterfaceType != NetworkInterfaceType.Loopback)
-            .SelectMany(n => n.GetIPProperties().UnicastAddresses)
-            .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork)
-            .Select(a => a.Address.ToString());
+        var addresses = NetworkInfo.LanAddresses();
         _connect.Text = $"Clients connect to: {Environment.MachineName} or {string.Join(", ", addresses)}   port {config.Port}";
 
         _users.Items.Clear();

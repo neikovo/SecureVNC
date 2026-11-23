@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Net.NetworkInformation;
 using SecureVNC.Shared.Hosting;
 
 namespace SecureVNC.Server;
@@ -80,20 +81,29 @@ internal static class Program
 /// <summary>Tray icon: shows who is connected, so the person at the PC always knows.</summary>
 internal sealed class TrayContext : ApplicationContext
 {
+    private static readonly Color Idle = Color.FromArgb(0x1E, 0x9E, 0x4A);        // green: running, nobody connected
+    private static readonly Color Connected = Color.FromArgb(0xD3, 0x2F, 0x2F);   // red: someone is connected
+
     private readonly RfbServer _server;
     private readonly NotifyIcon _icon;
+    private readonly Icon _idleIcon = TrayIcons.Create(Idle);
+    private readonly Icon _connectedIcon = TrayIcons.Create(Connected);
+    private readonly ToolStripMenuItem _addressItem;
     private readonly ToolStripMenuItem _sessionsItem;
     private readonly Control _ui = new();
     private readonly RegisteredWaitHandle? _stopWait;
+    private IReadOnlyList<string> _addresses = [];
 
     public TrayContext(RfbServer server, bool agent, EventWaitHandle? stopEvent)
     {
         _server = server;
         _ui.CreateControl();
 
+        _addressItem = new ToolStripMenuItem("") { Enabled = false };
         _sessionsItem = new ToolStripMenuItem("No active sessions") { Enabled = false };
         var menu = new ContextMenuStrip();
         menu.Items.Add(new ToolStripMenuItem($"SecureVNC - port {server.Port}{(agent ? " (service)" : "")}") { Enabled = false });
+        menu.Items.Add(_addressItem);
         menu.Items.Add(_sessionsItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Disconnect all", null, (_, _) => _server.DisconnectAll());
@@ -108,7 +118,7 @@ internal sealed class TrayContext : ApplicationContext
 
         _icon = new NotifyIcon
         {
-            Icon = SystemIcons.Shield,
+            Icon = _idleIcon,
             Text = "SecureVNC Server",
             ContextMenuStrip = menu,
             Visible = true,
@@ -116,7 +126,7 @@ internal sealed class TrayContext : ApplicationContext
 
         server.SessionStarted += s => OnUi(() =>
         {
-            _icon.ShowBalloonTip(5000, "SecureVNC", $"{s.UserName} connected from {s.Remote}", ToolTipIcon.Warning);
+            _icon.ShowBalloonTip(5000, "SecureVNC", $"{s.UserName} connected from {NetworkInfo.Display(s.Remote)}", ToolTipIcon.Warning);
             Refresh();
         });
         server.SessionEnded += s => OnUi(() =>
@@ -124,6 +134,7 @@ internal sealed class TrayContext : ApplicationContext
             _icon.ShowBalloonTip(3000, "SecureVNC", $"{s.UserName} disconnected", ToolTipIcon.Info);
             Refresh();
         });
+        NetworkChange.NetworkAddressChanged += OnAddressChanged;
 
         if (stopEvent is not null)
         {
@@ -133,6 +144,22 @@ internal sealed class TrayContext : ApplicationContext
                 OnUi(ExitThread);
             }, null, Timeout.Infinite, executeOnlyOnce: true);
         }
+
+        UpdateAddresses();
+        Refresh();
+    }
+
+    private void OnAddressChanged(object? sender, EventArgs e) => OnUi(() =>
+    {
+        UpdateAddresses();
+        Refresh();
+    });
+
+    private void UpdateAddresses()
+    {
+        try { _addresses = NetworkInfo.LanAddresses(); }
+        catch (Exception ex) { Log.Info($"Cannot list addresses: {ex.Message}"); }
+        _addressItem.Text = $"{Environment.MachineName}  {string.Join(", ", _addresses)}";
     }
 
     private void OnUi(Action a)
@@ -145,16 +172,28 @@ internal sealed class TrayContext : ApplicationContext
         var sessions = _server.Sessions;
         _sessionsItem.Text = sessions.Count == 0
             ? "No active sessions"
-            : string.Join("\n", sessions.Select(s => $"{s.UserName} from {s.Remote} since {s.StartedAt:HH:mm}"));
-        _icon.Icon = sessions.Count == 0 ? SystemIcons.Shield : SystemIcons.Warning;
-        _icon.Text = sessions.Count == 0 ? "SecureVNC Server" : $"SecureVNC - {sessions.Count} connected";
+            : string.Join("\n", sessions.Select(s => $"{s.UserName} from {NetworkInfo.Display(s.Remote)} since {s.StartedAt:HH:mm}"));
+        _icon.Icon = sessions.Count == 0 ? _idleIcon : _connectedIcon;
+
+        // Hover text (Windows allows at most 127 characters).
+        var status = sessions.Count switch
+        {
+            0 => "SecureVNC - ready, no connection",
+            1 => $"SecureVNC - CONNECTED: {sessions[0].UserName} ({NetworkInfo.Display(sessions[0].Remote)})",
+            _ => $"SecureVNC - CONNECTED: {sessions.Count} sessions",
+        };
+        var text = $"{status}\nIP: {(_addresses.Count == 0 ? "no network" : string.Join(", ", _addresses))}\nPort {_server.Port}";
+        _icon.Text = text.Length <= 127 ? text : text[..124] + "...";
     }
 
     protected override void ExitThreadCore()
     {
+        NetworkChange.NetworkAddressChanged -= OnAddressChanged;
         _stopWait?.Unregister(null);
         _icon.Visible = false;
         _icon.Dispose();
+        _idleIcon.Dispose();
+        _connectedIcon.Dispose();
         _ui.Dispose();
         base.ExitThreadCore();
     }
