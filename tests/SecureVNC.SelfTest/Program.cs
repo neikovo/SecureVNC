@@ -5,6 +5,7 @@ using SecureVNC.AuthServer;
 using SecureVNC.Server;
 using SecureVNC.Shared.Central;
 using SecureVNC.Shared.Hosting;
+using SecureVNC.Shared.Protocol;
 using SecureVNC.Shared.Security;
 
 // End-to-end self-test: real server + real client on loopback, temporary data folder.
@@ -103,6 +104,43 @@ if (client is not null)
     client.SendCtrlAltDel();
     Thread.Sleep(3000);
     Check(server.Sessions.Count == 1, "Ctrl+Alt+Del without service: session stays up");
+
+    // ----- Picture: monitor list, monitor choice, JPEG and 16-bit colour on the real screen -----
+    var vc = VideoChoice.Parse(new VideoPreferences(PictureQuality.LowBandwidth, 5, 2).ToEncodings());
+    Check(vc is { Mode: RectMode.Jpeg, JpegQuality: 50, MaxFps: 5, Monitor: 2, WantsMonitorList: true }, "viewer choices travel in SetEncodings and are read back");
+    var monitorsSeen = new ManualResetEventSlim();
+    client.MonitorsChanged += () => monitorsSeen.Set();
+    if (client.Monitors.Count == 0) monitorsSeen.Wait(5000);
+    Check(client.Monitors.Count >= 1, $"monitor list received ({string.Join(", ", client.Monitors.Select(m => $"{m.Width}x{m.Height}{(m.Primary ? "*" : "")}"))})");
+
+    long FullFrame(VideoPreferences prefs)
+    {
+        using var full = new ManualResetEventSlim();
+        void OnRegion(System.Drawing.Rectangle r) { if (r.X == 0 && r.Y == 0 && r.Width == client!.Width && r.Height == client.Height) full.Set(); }
+        long before = client!.BytesReceived;
+        client.RegionUpdated += OnRegion;
+        client.SetVideo(prefs);
+        bool got = full.Wait(10_000);
+        client.RegionUpdated -= OnRegion;
+        return got ? client.BytesReceived - before : -1;
+    }
+    // (asking for the mode already in use sends no new full picture, so start with a change)
+    long jpeg80 = FullFrame(new VideoPreferences(PictureQuality.Balanced));
+    long jpeg50 = FullFrame(new VideoPreferences(PictureQuality.LowBandwidth));
+    long colors16 = FullFrame(new VideoPreferences(PictureQuality.Colors16));
+    long lossless = FullFrame(new VideoPreferences(PictureQuality.Lossless));
+    Check(lossless > 0 && jpeg80 > 0 && jpeg50 > 0 && colors16 > 0 && server.Sessions.Count == 1,
+        $"picture modes work: lossless {lossless / 1024} KB, JPEG 80 {jpeg80 / 1024} KB, JPEG 50 {jpeg50 / 1024} KB, 16-bit {colors16 / 1024} KB per full screen");
+
+    if (client.Monitors.Count >= 1)
+    {
+        var first = client.Monitors[0];
+        long one = FullFrame(client.Video with { Quality = PictureQuality.Lossless, Monitor = 1 });
+        Check(one > 0 && client.Width == first.Width && client.Height == first.Height,
+            $"monitor 1 only: picture is {client.Width}x{client.Height} (monitor {first.Width}x{first.Height})");
+        FullFrame(client.Video with { Monitor = 0 });
+        Check(client.Width >= first.Width, $"all monitors again: {client.Width}x{client.Height}");
+    }
     client.Dispose();
 }
 

@@ -138,6 +138,10 @@ Notes:
 - If the user on that computer logs off or switches user, the connection ends; connect again with a new code.
 - **Emergency login** (checkbox) is only for a local emergency account on a computer in mode B. Leave it off normally.
 - After a successful login you get screen, mouse and keyboard only. There is no file transfer or clipboard.
+- The viewer toolbar has three menus:
+  - **Monitor:** all monitors or one of them.
+  - **Quality:** *Best quality (lossless)* for the LAN, *Balanced (JPEG 80)*, *Low bandwidth (JPEG 50)* for slow links, *16-bit colour*.
+  - **Frame rate:** 30 / 15 / 5 fps.
 
 ### Help requests from colleagues
 

@@ -1,10 +1,14 @@
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO.Compression;
 using SecureVNC.Shared.Protocol;
 
 namespace SecureVNC.Server;
 
-/// <summary>Finds changed 64x64 tiles against the previous frame and encodes them as zlib rectangles.</summary>
+/// <summary>
+/// Finds changed 64x64 tiles against the previous frame and encodes them as the viewer prefers:
+/// zlib (lossless), JPEG (lossy, small) or zlib of 16-bit colour.
+/// </summary>
 internal sealed class FrameEncoder
 {
     private const int Tile = 64;
@@ -81,13 +85,26 @@ internal sealed class FrameEncoder
         rects.Add(r);
     }
 
+    private static readonly ImageCodecInfo JpegCodec = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == ImageFormat.Jpeg.Guid);
+    private readonly MemoryStream _jpeg = new();
+
     /// <summary>Appends one rectangle (header + payload) of the current frame to the update message.</summary>
-    public void EncodeRect(RfbWriter w, ReadOnlySpan<byte> frame, int frameWidth, Rectangle r)
+    public void EncodeRect(RfbWriter w, ReadOnlySpan<byte> frame, int frameWidth, Rectangle r, VideoChoice? video = null)
     {
         int rowBytes = r.Width * 4, len = rowBytes * r.Height;
         if (_scratch.Length < len) _scratch = new byte[len];
         for (int row = 0; row < r.Height; row++)
             frame.Slice(((r.Y + row) * frameWidth + r.X) * 4, rowBytes).CopyTo(_scratch.AsSpan(row * rowBytes));
+
+        switch (video?.Mode)
+        {
+            case RectMode.Jpeg:
+                EncodeJpeg(w, r, video.JpegQuality);
+                return;
+            case RectMode.Zlib16:
+                EncodeZlib16(w, r);
+                return;
+        }
 
         _zbuf.SetLength(0);
         using (var z = new ZLibStream(_zbuf, CompressionLevel.Fastest, leaveOpen: true))
@@ -102,5 +119,48 @@ internal sealed class FrameEncoder
         {
             w.S32(Rfb.EncodingRaw).Bytes(_scratch.AsSpan(0, len));
         }
+    }
+
+    private void EncodeJpeg(RfbWriter w, Rectangle r, int quality)
+    {
+        using (var bmp = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppRgb))
+        {
+            var data = bmp.LockBits(new Rectangle(0, 0, r.Width, r.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
+            try
+            {
+                for (int row = 0; row < r.Height; row++)
+                    System.Runtime.InteropServices.Marshal.Copy(_scratch, row * r.Width * 4, data.Scan0 + row * data.Stride, r.Width * 4);
+            }
+            finally
+            {
+                bmp.UnlockBits(data);
+            }
+            using var parameters = new EncoderParameters(1);
+            parameters.Param[0] = new EncoderParameter(Encoder.Quality, (long)quality);
+            _jpeg.SetLength(0);
+            bmp.Save(_jpeg, JpegCodec, parameters);
+        }
+        w.U16((ushort)r.X).U16((ushort)r.Y).U16((ushort)r.Width).U16((ushort)r.Height)
+            .S32(Rfb.EncodingJpegRect).U32((uint)_jpeg.Length).Bytes(_jpeg.GetBuffer().AsSpan(0, (int)_jpeg.Length));
+    }
+
+    private byte[] _rgb565 = [];
+
+    private void EncodeZlib16(RfbWriter w, Rectangle r)
+    {
+        int pixels = r.Width * r.Height;
+        if (_rgb565.Length < pixels * 2) _rgb565 = new byte[pixels * 2];
+        for (int i = 0; i < pixels; i++)
+        {
+            int b = _scratch[i * 4], g = _scratch[i * 4 + 1], red = _scratch[i * 4 + 2];
+            int v = ((red >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+            _rgb565[i * 2] = (byte)v;
+            _rgb565[i * 2 + 1] = (byte)(v >> 8);
+        }
+        _zbuf.SetLength(0);
+        using (var z = new ZLibStream(_zbuf, CompressionLevel.Fastest, leaveOpen: true))
+            z.Write(_rgb565, 0, pixels * 2);
+        w.U16((ushort)r.X).U16((ushort)r.Y).U16((ushort)r.Width).U16((ushort)r.Height)
+            .S32(Rfb.EncodingZlib16Rect).U32((uint)_zbuf.Length).Bytes(_zbuf.GetBuffer().AsSpan(0, (int)_zbuf.Length));
     }
 }

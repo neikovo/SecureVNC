@@ -38,6 +38,31 @@ public sealed class RfbClient : IDisposable
 
     public event Action<Rectangle>? RegionUpdated;
     public event Action? Resized;
+    /// <summary>The remote computer's monitors changed (or the server confirmed a choice).</summary>
+    public event Action? MonitorsChanged;
+
+    public VideoPreferences Video { get; private set; } = new();
+    /// <summary>Picture data received (encoded bytes), for diagnostics and tests.</summary>
+    public long BytesReceived { get; private set; }
+    public IReadOnlyList<MonitorInfo> Monitors { get; private set; } = [];
+    public int SelectedMonitor { get; private set; }
+
+    /// <summary>Picture quality, frame rate and monitor; takes effect with the next frame.</summary>
+    public void SetVideo(VideoPreferences video)
+    {
+        Video = video;
+        SendPreferences();
+    }
+
+    private void SendPreferences()
+    {
+        var encodings = Video.ToEncodings();
+        Send(w =>
+        {
+            w.U8(Rfb.ClientSetEncodings).U8(0).U16((ushort)encodings.Length);
+            foreach (var e in encodings) w.S32(e);
+        });
+    }
     public event Action<Exception?>? Disconnected;
 
     public static RfbClient Connect(ConnectOptions o, TrustStore trust, TrustPrompt prompt)
@@ -150,8 +175,7 @@ public sealed class RfbClient : IDisposable
         Frame = new Bitmap(Math.Max(1, Width), Math.Max(1, Height), PixelFormat.Format32bppRgb);
         ns.ReadTimeout = Timeout.Infinite;
 
-        Send(w => w.U8(Rfb.ClientSetEncodings).U8(0).U16(3)
-            .S32(Rfb.EncodingZlibRect).S32(Rfb.EncodingRaw).S32(Rfb.PseudoEncodingDesktopSize));
+        SendPreferences();
     }
 
     /// <summary>
@@ -268,7 +292,7 @@ public sealed class RfbClient : IDisposable
         {
             int x = r.U16(), y = r.U16(), w = r.U16(), h = r.U16();
             int encoding = r.S32();
-            if (encoding != Rfb.PseudoEncodingDesktopSize && (x + w > Width || y + h > Height))
+            if (encoding is not (Rfb.PseudoEncodingDesktopSize or Rfb.PseudoMonitorList) && (x + w > Width || y + h > Height))
                 throw new ProtocolException("Rectangle outside the screen.");
             switch (encoding)
             {
@@ -283,11 +307,57 @@ public sealed class RfbClient : IDisposable
                     }
                     Resized?.Invoke();
                     continue;
+                case Rfb.PseudoMonitorList:
+                {
+                    int selected = r.U8(), n = r.U8();
+                    if (n > Rfb.MaxMonitors) throw new ProtocolException("Too many monitors.");
+                    var list = new List<MonitorInfo>(n);
+                    for (int m = 0; m < n; m++)
+                        list.Add(new MonitorInfo(r.S32(), r.S32(), r.U16(), r.U16(), r.U8() != 0));
+                    Monitors = list;
+                    SelectedMonitor = selected <= n ? selected : 0;
+                    MonitorsChanged?.Invoke();
+                    continue;
+                }
+                case Rfb.EncodingJpegRect:
+                {
+                    int jlen = (int)r.U32();
+                    if (jlen <= 0 || jlen > 64 * 1024 * 1024) throw new ProtocolException("Bad JPEG rectangle.");
+                    EnsureCapacity(ref _compressed, jlen);
+                    r.ReadExactly(_compressed.AsSpan(0, jlen));
+                    BytesReceived += jlen;
+                    DecodeJpeg(jlen, w, h);
+                    break;
+                }
+                case Rfb.EncodingZlib16Rect:
+                {
+                    int clen16 = (int)r.U32();
+                    if (clen16 <= 0 || clen16 > 64 * 1024 * 1024) throw new ProtocolException("Rectangle too large.");
+                    EnsureCapacity(ref _compressed, clen16);
+                    r.ReadExactly(_compressed.AsSpan(0, clen16));
+                    BytesReceived += clen16;
+                    int pixels = w * h;
+                    EnsureCapacity(ref _rgb565, pixels * 2);
+                    using (var z = new ZLibStream(new MemoryStream(_compressed, 0, clen16), CompressionMode.Decompress))
+                        z.ReadExactly(_rgb565, 0, pixels * 2);
+                    EnsureCapacity(ref _pixels, pixels * 4);
+                    for (int p = 0; p < pixels; p++)
+                    {
+                        int v = _rgb565[p * 2] | (_rgb565[p * 2 + 1] << 8);
+                        int red = (v >> 11) & 31, green = (v >> 5) & 63, blue = v & 31;
+                        _pixels[p * 4] = (byte)((blue << 3) | (blue >> 2));
+                        _pixels[p * 4 + 1] = (byte)((green << 2) | (green >> 4));
+                        _pixels[p * 4 + 2] = (byte)((red << 3) | (red >> 2));
+                        _pixels[p * 4 + 3] = 255;
+                    }
+                    break;
+                }
                 case Rfb.EncodingRaw:
                 {
                     int len = w * h * 4;
                     EnsureCapacity(ref _pixels, len);
                     r.ReadExactly(_pixels.AsSpan(0, len));
+                    BytesReceived += len;
                     break;
                 }
                 case Rfb.EncodingZlibRect:
@@ -296,6 +366,7 @@ public sealed class RfbClient : IDisposable
                     if (clen > 64 * 1024 * 1024) throw new ProtocolException("Rectangle too large.");
                     EnsureCapacity(ref _compressed, clen);
                     r.ReadExactly(_compressed.AsSpan(0, clen));
+                    BytesReceived += clen;
                     int len = w * h * 4;
                     EnsureCapacity(ref _pixels, len);
                     using var z = new ZLibStream(new MemoryStream(_compressed, 0, clen), CompressionMode.Decompress);
@@ -344,6 +415,27 @@ public sealed class RfbClient : IDisposable
     }
 
     private const int MaxScreenSide = 16384;   // 16384 x 16384 x 4 bytes = 1 GiB at most; real screens are far smaller
+
+    private byte[] _rgb565 = [];
+
+    /// <summary>JPEG rectangle -> 32bpp pixels in <c>_pixels</c> (size must match the rectangle).</summary>
+    private void DecodeJpeg(int length, int w, int h)
+    {
+        using var ms = new MemoryStream(_compressed, 0, length);
+        using var img = new Bitmap(ms);
+        if (img.Width != w || img.Height != h) throw new ProtocolException("JPEG size does not match the rectangle.");
+        EnsureCapacity(ref _pixels, w * h * 4);
+        var data = img.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+        try
+        {
+            for (int row = 0; row < h; row++)
+                System.Runtime.InteropServices.Marshal.Copy(data.Scan0 + row * data.Stride, _pixels, row * w * 4, w * 4);
+        }
+        finally
+        {
+            img.UnlockBits(data);
+        }
+    }
 
     private static void EnsureCapacity(ref byte[] buffer, int size)
     {

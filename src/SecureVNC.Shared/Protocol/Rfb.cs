@@ -40,6 +40,13 @@ public static class Rfb
     public const int EncodingRaw = 0;
     public const int EncodingZlibRect = -512;            // SecureVNC: independent zlib stream per rectangle
     public const int PseudoEncodingDesktopSize = -223;
+    public const int EncodingJpegRect = -513;            // SecureVNC: U32 length + JPEG of the rectangle
+    public const int EncodingZlib16Rect = -514;          // SecureVNC: U32 length + zlib of RGB565 (little-endian) pixels
+    public const int PseudoMonitorList = -1001;          // client: "send me the monitor list"; server: a rectangle carrying it
+    public const int PseudoMonitorSelectBase = -1200;    // -1200 - n: show monitor n (0 = all monitors)
+    public const int PseudoJpegQualityBase = -1300;      // -1300 - q: JPEG quality 10..95
+    public const int PseudoMaxFpsBase = -1400;           // -1400 - f: at most f frames per second (1..60)
+    public const int MaxMonitors = 16;
 
     // Pointer button mask bits
     public const byte ButtonLeft = 1, ButtonMiddle = 2, ButtonRight = 4;

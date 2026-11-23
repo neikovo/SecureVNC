@@ -4,8 +4,8 @@ using static SecureVNC.Server.Native;
 namespace SecureVNC.Server;
 
 /// <summary>
-/// Captures the whole virtual desktop (all monitors) into a top-down 32bpp BGRX DIB with GDI,
-/// including the mouse cursor.
+/// Captures the whole virtual desktop (all monitors), or one monitor (<see cref="Region"/>), into a top-down
+/// 32bpp BGRX DIB with GDI, including the mouse cursor.
 /// </summary>
 internal sealed unsafe class ScreenCapturer : IDisposable
 {
@@ -17,6 +17,12 @@ internal sealed unsafe class ScreenCapturer : IDisposable
     public int Width { get; private set; }
     public int Height { get; private set; }
     public int Stride => Width * 4;
+    /// <summary>Top-left of the whole virtual desktop at the last capture.</summary>
+    public int VirtualLeft { get; private set; }
+    public int VirtualTop { get; private set; }
+
+    /// <summary>Part of the desktop to capture, in screen coordinates (one monitor); null = everything.</summary>
+    public Rectangle? Region { get; set; }
 
     public ReadOnlySpan<byte> Pixels => new(_bits, Width * Height * 4);
 
@@ -26,6 +32,13 @@ internal sealed unsafe class ScreenCapturer : IDisposable
         int l = GetSystemMetrics(SM_XVIRTUALSCREEN), t = GetSystemMetrics(SM_YVIRTUALSCREEN);
         int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         if (w <= 0 || h <= 0) return false;
+        VirtualLeft = l;
+        VirtualTop = t;
+        if (Region is { } region)
+        {
+            var part = Rectangle.Intersect(region, new Rectangle(l, t, w, h));
+            if (part.Width > 0 && part.Height > 0) (l, t, w, h) = (part.X, part.Y, part.Width, part.Height);
+        }
         if (_screenDc == 0) _screenDc = GetDC(0);
         if (w != Width || h != Height || _dib == 0) Recreate(w, h);
         Left = l;

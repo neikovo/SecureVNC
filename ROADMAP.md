@@ -1,6 +1,6 @@
 # SecureVNC – Roadmap
 
-Planned work, in the intended order. Done so far: item 0, phase A (1.5.0).
+Planned work, in the intended order. Done so far: item 0 phase A (1.5.0); items 1 and 2 except DXGI and H.264 (1.6.0).
 
 ## Features
 
@@ -19,12 +19,14 @@ For colleagues who find computers hard: they ask for help with one click, the ad
 - **Phase B (with WireGuard, item 3):** requests delivered through the Auth Server over the computer's authenticated connection. Works across subnets and VPN, keeps a queue while viewers are off, every request in the audit; the viewer logs in to an administrator "inbox".
 - Size: phase A medium; phase B medium to large.
 
-### 1. Monitor selection
+### 1. Monitor selection – done in 1.6.0
 - Today the viewer shows the whole desktop (all monitors together).
 - Viewer menu: **Monitor 1 / Monitor 2 / … / All**; mouse input mapped to the chosen monitor.
 - Size: small.
 
-### 2. Picture encoding choice (+ faster capture)
+### 2. Picture encoding choice (+ faster capture) – partly done in 1.6.0
+- **Done:** lossless, JPEG 80, JPEG 50, 16-bit colour, 30/15/5 fps (viewer toolbar). Measured on a 2560x1440 screen: lossless 478 KB, 16-bit 254 KB, JPEG 80 227 KB, JPEG 50 166 KB per full picture.
+- **Still to do:** DXGI capture and H.264 (need testing on real hardware; DXGI does not work inside an RDP session).
 - Today: lossless zlib per rectangle – ideal on a LAN, heavy over the internet.
 - Selectable modes: **lossless** (current), **JPEG with quality setting**, **16-bit colour**, **H.264 video** (optionally hardware accelerated), **frame-rate limit**.
 - Screen capture via **DXGI Desktop Duplication** instead of GDI.

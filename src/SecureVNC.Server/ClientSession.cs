@@ -25,6 +25,8 @@ internal sealed class ClientSession(
     private volatile bool _closed;
     private bool _requestPending, _requestFull;
     private SslStream? _ssl;
+    private volatile VideoChoice _video = VideoChoice.Default;
+    private volatile int _pointerOffsetX, _pointerOffsetY;   // shown monitor's position inside the whole desktop
 
     public IPAddress Remote => remote;
     public string? UserName { get; private set; }
@@ -211,9 +213,24 @@ internal sealed class ClientSession(
                     r.Skip(3 + 16);   // always 32bpp BGRX
                     break;
                 case Rfb.ClientSetEncodings:
+                {
                     r.Skip(1);
-                    r.Skip(r.U16() * 4L);   // our client always supports ZlibRect + Raw + DesktopSize
+                    int count = r.U16();
+                    if (count > 64) throw new ProtocolException("Too many encodings");
+                    var encodings = new int[count];
+                    for (int i = 0; i < count; i++) encodings[i] = r.S32();
+                    var before = _video;
+                    _video = VideoChoice.Parse(encodings);
+                    if (before.Monitor != _video.Monitor || before.Mode != _video.Mode || before.JpegQuality != _video.JpegQuality)
+                    {
+                        lock (_requestLock)
+                        {
+                            _requestPending = _requestFull = true;   // new picture settings: send the whole picture again
+                            Monitor.Pulse(_requestLock);
+                        }
+                    }
                     break;
+                }
                 case Rfb.ClientFramebufferUpdateRequest:
                     bool incremental = r.U8() != 0;
                     r.Skip(8);   // region: we always consider the whole screen
@@ -234,7 +251,7 @@ internal sealed class ClientSession(
                     if (!config.ViewOnly)
                     {
                         DesktopSwitcher.SyncThreadToInputDesktop();   // input must go to the visible desktop
-                        _input.Pointer(mask, x, y);
+                        _input.Pointer(mask, x + _pointerOffsetX, y + _pointerOffsetY);
                     }
                     break;
                 }
@@ -272,9 +289,11 @@ internal sealed class ClientSession(
 
     private void UpdateLoop()
     {
-        var frameInterval = TimeSpan.FromMilliseconds(1000.0 / Math.Clamp(config.MaxFramesPerSecond, 1, 60));
         var clock = Stopwatch.StartNew();
-        var lastFrame = TimeSpan.Zero - frameInterval;
+        var lastFrame = TimeSpan.Zero;
+        List<Rectangle> monitors = [];
+        var monitorsCheckedAt = TimeSpan.FromSeconds(-10);
+        string sentMonitorKey = "";
         var encoder = new FrameEncoder();
         var w = new RfbWriter();
         int sentW = 0, sentH = 0;
@@ -292,6 +311,8 @@ internal sealed class ClientSession(
                     full = _requestFull;
                 }
 
+                var video = _video;
+                var frameInterval = TimeSpan.FromMilliseconds(1000.0 / Math.Clamp(Math.Min(config.MaxFramesPerSecond, video.MaxFps), 1, 60));
                 var wait = lastFrame + frameInterval - clock.Elapsed;
                 if (wait > TimeSpan.Zero) Thread.Sleep(wait);
                 lastFrame = clock.Elapsed;
@@ -301,6 +322,13 @@ internal sealed class ClientSession(
                     capturer.ResetDesktop();
                     Log.Info($"{remote}: now showing desktop '{DesktopSwitcher.CurrentName}'");
                 }
+                if (clock.Elapsed - monitorsCheckedAt > TimeSpan.FromSeconds(2))
+                {
+                    monitors = Monitors.Bounds();
+                    monitorsCheckedAt = clock.Elapsed;
+                }
+                int selected = video.Monitor >= 1 && video.Monitor <= monitors.Count ? video.Monitor : 0;
+                capturer.Region = selected == 0 ? null : monitors[selected - 1];
                 if (!capturer.Capture())
                 {
                     // Lock screen / UAC secure desktop cannot be read from the user session.
@@ -311,11 +339,26 @@ internal sealed class ClientSession(
                 }
                 if (captureBlocked) Log.Info($"{remote}: screen readable again");
                 captureBlocked = false;
+                _pointerOffsetX = capturer.Left - capturer.VirtualLeft;
+                _pointerOffsetY = capturer.Top - capturer.VirtualTop;
                 int cw = capturer.Width, ch = capturer.Height;
                 bool resized = sentW != 0 && (cw != sentW || ch != sentH);
                 var pixels = capturer.Pixels;
                 List<Rectangle> rects = encoder.Diff(pixels, cw, ch, full || resized);
-                if (rects.Count == 0) continue;   // nothing changed; the request stays pending
+
+                // Monitor list for the viewer's menu: sent first time and whenever monitors or the choice change.
+                List<MonitorInfo>? monitorList = null;
+                if (video.WantsMonitorList)
+                {
+                    var described = Monitors.Describe(monitors, capturer.VirtualLeft, capturer.VirtualTop);
+                    var key = selected + "|" + string.Join(";", described);
+                    if (key != sentMonitorKey)
+                    {
+                        monitorList = described;
+                        sentMonitorKey = key;
+                    }
+                }
+                if (rects.Count == 0 && monitorList is null) continue;   // nothing changed; the request stays pending
 
                 lock (_requestLock)
                 {
@@ -323,10 +366,16 @@ internal sealed class ClientSession(
                     if (full) _requestFull = false;
                 }
 
-                w.Reset().U8(Rfb.ServerFramebufferUpdate).U8(0).U16((ushort)(rects.Count + (resized ? 1 : 0)));
+                w.Reset().U8(Rfb.ServerFramebufferUpdate).U8(0).U16((ushort)(rects.Count + (resized ? 1 : 0) + (monitorList is null ? 0 : 1)));
                 if (resized)
                     w.U16(0).U16(0).U16((ushort)cw).U16((ushort)ch).S32(Rfb.PseudoEncodingDesktopSize);
-                foreach (var rect in rects) encoder.EncodeRect(w, pixels, cw, rect);
+                if (monitorList is not null)
+                {
+                    w.U16(0).U16(0).U16(0).U16(0).S32(Rfb.PseudoMonitorList).U8((byte)selected).U8((byte)monitorList.Count);
+                    foreach (var m in monitorList)
+                        w.S32(m.X).S32(m.Y).U16((ushort)m.Width).U16((ushort)m.Height).U8((byte)(m.Primary ? 1 : 0));
+                }
+                foreach (var rect in rects) encoder.EncodeRect(w, pixels, cw, rect, video);
                 Send(w);
                 sentW = cw;
                 sentH = ch;
