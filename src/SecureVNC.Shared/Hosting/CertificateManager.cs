@@ -43,7 +43,7 @@ public static class CertificateManager
     /// <summary>Signs a certificate for a public key (generated elsewhere, e.g. on a computer joining the auth server).</summary>
     public static X509Certificate2 IssueCertificate(
         X509Certificate2 ca, PublicKey publicKey, string commonName,
-        IEnumerable<string> dnsNames, IEnumerable<IPAddress> ips, bool clientAuth)
+        IEnumerable<string> dnsNames, IEnumerable<IPAddress> ips, bool clientAuth, TimeSpan? lifetime = null)
     {
         var req = new CertificateRequest(new X500DistinguishedName($"CN={commonName}, O=SecureVNC"), publicKey, HashAlgorithmName.SHA256);
         req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
@@ -59,7 +59,7 @@ public static class CertificateManager
         req.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromCertificate(ca, true, false));
 
         var notBefore = DateTimeOffset.UtcNow.AddMinutes(-10);
-        var notAfter = notBefore.AddYears(1);
+        var notAfter = lifetime is { } l ? notBefore + l : notBefore.AddYears(1);
         if (notAfter > ca.NotAfter.AddDays(-1)) notAfter = ca.NotAfter.AddDays(-1);
         var serial = RandomNumberGenerator.GetBytes(16);
         serial[0] &= 0x7F;

@@ -27,12 +27,14 @@ public sealed partial class CentralAuthService(AuthPaths paths)
     private ServerCredentials? _creds;
     private DateTime _credsCheckedUtc;
     private X509Certificate2? _ca;
+    private readonly ConnectionLimiter _limiter = new(maxTotal: 64, maxPerAddress: 8);
 
     public int Port => _config.Port;
 
     public void Start(string? listenAddress = null)
     {
-        if (!paths.IsInitialized) AuthData.Initialize(paths, Log.Info);
+        if (paths.IsInitialized) ServerPaths.Harden(paths.DataDir);   // ownership and links, see ServerPaths
+        else AuthData.Initialize(paths, Log.Info);
         _ca = new X509Certificate2(File.ReadAllBytes(paths.CaCertFile));
         _throttle = new AuthThrottle(_config.MaxFailedAttempts, TimeSpan.FromMinutes(_config.LockoutMinutes));
         GetCredentials();
@@ -80,7 +82,16 @@ public sealed partial class CentralAuthService(AuthPaths paths)
                 tcp.Dispose();
                 continue;
             }
-            _ = Task.Run(() => Handle(tcp, ip));
+            if (!_limiter.TryEnter(ip, Log.Info))
+            {
+                tcp.Dispose();
+                continue;
+            }
+            _ = Task.Run(() =>
+            {
+                try { Handle(tcp, ip); }
+                finally { _limiter.Leave(ip); }
+            });
         }
     }
 
@@ -104,7 +115,7 @@ public sealed partial class CentralAuthService(AuthPaths paths)
             var response = request.Op switch
             {
                 "enroll" => Enroll(request, ip),
-                "renew" => WithComputer(computerCert, ip, c => Renew(request, c, ip)),
+                "renew" => WithComputer(computerCert, ip, c => Renew(request, c, ip), allowPending: true),
                 "verify" => WithComputer(computerCert, ip, c => Verify(request, c, ip)),
                 "ping" => WithComputer(computerCert, ip, c => new CentralResponse { Ok = true, MachineName = c.Name }),
                 _ => new CentralResponse { Error = "Unknown request." },
@@ -133,15 +144,17 @@ public sealed partial class CentralAuthService(AuthPaths paths)
         return chain.Build(new X509Certificate2(cert));
     }
 
-    private CentralResponse WithComputer(X509Certificate2? cert, IPAddress ip, Func<ComputerRecord, CentralResponse> action)
+    private CentralResponse WithComputer(X509Certificate2? cert, IPAddress ip, Func<ComputerRecord, CentralResponse> action, bool allowPending = false)
     {
         if (cert is null) return new CentralResponse { Error = "This computer has not joined." };
         var computer = ComputerStore.Load(paths).BySerial(cert.SerialNumber);
         if (computer is null || computer.Revoked)
         {
-            AuditLine($"REFUSED  computer certificate {cert.Subject} from {ip}: {(computer is null ? "unknown" : "removed")} computer");
-            return new CentralResponse { Error = "This computer is not allowed. Join it again." };
+            AuditLine($"REFUSED  computer certificate {cert.Subject} from {ip}: {(computer is null ? "unknown or deleted" : "blocked")} computer");
+            return new CentralResponse { Error = computer is null ? "This computer is not registered. Join it again." : "This computer is blocked in the Auth Console." };
         }
+        if (computer.Pending && !allowPending)
+            return new CentralResponse { Error = "This computer waits for approval in the Auth Console." };
         return action(computer);
     }
 
@@ -171,8 +184,14 @@ public sealed partial class CentralAuthService(AuthPaths paths)
 
         // A name that belongs to another registered computer cannot be taken over (its certificate is what
         // viewers trust for that name). Remove the old entry in the Auth Console first.
-        var taken = ComputerStore.Load(paths).Computers.FirstOrDefault(c =>
-            !c.Revoked && string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase) &&
+        var computers = ComputerStore.Load(paths).Computers;
+        if (computers.Any(c => c.Revoked && c.Same(name, guid)))
+        {
+            AuditLine($"JOIN-REFUSED  {name} from {ip}: the computer is blocked");
+            return new CentralResponse { Error = "This computer is blocked in the Auth Console." };
+        }
+        var taken = computers.FirstOrDefault(c =>
+            string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase) &&
             !string.Equals(c.MachineGuid, guid, StringComparison.OrdinalIgnoreCase));
         if (taken is not null)
         {
@@ -180,24 +199,23 @@ public sealed partial class CentralAuthService(AuthPaths paths)
             return new CentralResponse { Error = $"A computer named {name} is already registered. Remove it in the Auth Console first." };
         }
 
-        var cert = Issue(name, r.PublicKey, ip);
+        var cert = Issue(name, guid, r.PublicKey, ip);
+        bool pending = false;
         ComputerStore.Update(paths, store =>
         {
-            var record = store.Computers.FirstOrDefault(c =>
-                string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(c.MachineGuid, guid, StringComparison.OrdinalIgnoreCase));
+            var record = store.Computers.FirstOrDefault(c => c.Same(name, guid));
             if (record is null)
             {
-                record = new ComputerRecord { Name = name, MachineGuid = guid };
+                record = new ComputerRecord { Name = name, MachineGuid = guid, Pending = AuthConfig.Load(paths).RequireApproval };   // read now: changed in the Auth Console without restart
                 store.Computers.Add(record);
             }
-            record.Revoked = false;
+            pending = record.Pending;
             record.Serials = [cert.SerialNumber];   // joining again replaces the old certificates
             record.JoinedUtc = record.LastSeenUtc = DateTime.UtcNow;
             record.LastAddress = AuthData.Display(ip);
             return 0;
         });
-        AuditLine($"JOINED  {name} from {ip}");
+        AuditLine($"JOINED  {name} from {ip}{(pending ? " - waits for approval" : "")}");
         return new CentralResponse
         {
             Ok = true, MachineName = name,
@@ -209,7 +227,7 @@ public sealed partial class CentralAuthService(AuthPaths paths)
     private CentralResponse Renew(CentralRequest r, ComputerRecord computer, IPAddress ip)
     {
         if (string.IsNullOrEmpty(r.PublicKey)) return new CentralResponse { Error = "Bad request." };
-        var cert = Issue(computer.Name, r.PublicKey, ip);
+        var cert = Issue(computer.Name, computer.MachineGuid, r.PublicKey, ip);
         ComputerStore.Update(paths, store =>
         {
             var record = store.BySerial(computer.Serials[0]);
@@ -266,11 +284,23 @@ public sealed partial class CentralAuthService(AuthPaths paths)
     /// The certificate names only this computer: its name and the address the auth server sees it on.
     /// Addresses the computer claims are not used, so it cannot obtain a certificate for someone else's address.
     /// </summary>
-    private X509Certificate2 Issue(string name, string publicKeyBase64, IPAddress ip)
+    private X509Certificate2 Issue(string name, string machineGuid, string publicKeyBase64, IPAddress ip)
     {
         var publicKey = PublicKey.CreateFromSubjectPublicKeyInfo(Convert.FromBase64String(publicKeyBase64), out _);
+
+        // An address another registered computer used recently stays out of the certificate (DHCP reuse, or
+        // someone taking the address of a computer that is off): viewers must not trust a stranger at that address.
+        string address = AuthData.Display(ip);
+        var holder = ComputerStore.Load(paths).Computers.FirstOrDefault(c =>
+            !c.Revoked && !c.Same(name, machineGuid) && c.LastAddress == address &&
+            c.LastSeenUtc > DateTime.UtcNow - CentralProtocol.ComputerCertificateLifetime - TimeSpan.FromDays(1));
+        IPAddress[] ips = holder is null ? [ip] : [];
+        if (holder is not null)
+            AuditLine($"ADDRESS-IN-USE  {name}: {address} was used by {holder.Name}; certificate issued for the name only");
+
         using var ca = CertificateManager.LoadProtected(paths.CaKeyFile);
-        return CertificateManager.IssueCertificate(ca, publicKey, name, [name, name + ".local"], [ip], clientAuth: true);
+        return CertificateManager.IssueCertificate(ca, publicKey, name, [name, name + ".local"], ips, clientAuth: true,
+            CentralProtocol.ComputerCertificateLifetime);
     }
 
     private void AuditLine(string line)

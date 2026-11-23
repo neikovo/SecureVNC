@@ -14,6 +14,7 @@ internal sealed class AuthMainForm : ManagerForm
     private readonly UsersPanel _admins = new();
     private readonly ListView _computers = new() { View = View.Details, FullRowSelect = true, MultiSelect = false, Width = 615, Height = 200, HideSelection = false };
     private readonly ListBox _audit = new() { Width = 615, Height = 220, Font = new Font("Consolas", 8.5f), HorizontalScrollbar = true };
+    private readonly CheckBox _approval = new() { Text = "New computers need my approval before they can log anyone in", AutoSize = true };
     private bool _keyShown;
 
     public AuthMainForm(AuthPaths paths, bool firstRun, string? user)
@@ -44,7 +45,7 @@ internal sealed class AuthMainForm : ManagerForm
             ("Restart service", RestartService),
             ("Open logs", () => Process.Start(new ProcessStartInfo(_paths.LogDir) { UseShellExecute = true }))));
 
-        var tabs = new TabControl { Width = ContentWidth + 10, Height = 345 };
+        var tabs = new TabControl { Width = ContentWidth + 10, Height = 370 };
         TabPage Page(string title, params Control[] content)
         {
             var page = new TabPage(title) { Padding = new Padding(8) };
@@ -65,15 +66,23 @@ internal sealed class AuthMainForm : ManagerForm
         _computers.Columns.Add("Last seen", 130);
         _computers.Columns.Add("Joined", 100);
         _computers.Columns.Add("Status", 95);
-        Page("Computers", _computers, Buttons(
+        Page("Computers", _approval, _computers, Buttons(
             ("Block", () => SetBlocked(true)),
-            ("Allow again", () => SetBlocked(false)),
+            ("Approve / allow", () => SetBlocked(false)),
             ("Delete entry", DeleteComputer),
             ("Refresh", RefreshAll)));
 
         Page("Audit", _audit, Buttons(("Refresh", RefreshAll)));
         Group("Manage").Controls.Add(tabs);
 
+        _approval.Checked = AuthConfig.Load(_paths).RequireApproval;
+        _approval.CheckedChanged += (_, _) =>
+        {
+            var config = AuthConfig.Load(_paths);
+            config.RequireApproval = _approval.Checked;
+            config.Save(_paths);
+            AuthData.Audit(_paths, $"APPROVAL {(config.RequireApproval ? "required" : "not required")} for new computers (Auth Console)");
+        };
         RefreshAll();
         if (firstRun && _admins.Count == 0)
             Shown += (_, _) => _admins.Dialog(UserDialogMode.Add, null,
@@ -101,8 +110,8 @@ internal sealed class AuthMainForm : ManagerForm
         {
             _computers.Items.Add(new ListViewItem([
                 c.Name, c.LastAddress, c.LastSeenUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
-                c.JoinedUtc.ToLocalTime().ToString("yyyy-MM-dd"), c.Revoked ? "BLOCKED" : "allowed",
-            ]) { Tag = c, ForeColor = c.Revoked ? Color.Firebrick : SystemColors.WindowText });
+                c.JoinedUtc.ToLocalTime().ToString("yyyy-MM-dd"), c.Revoked ? "BLOCKED" : c.Pending ? "WAITING" : "allowed",
+            ]) { Tag = c, ForeColor = c.Revoked ? Color.Firebrick : c.Pending ? Color.DarkOrange : SystemColors.WindowText });
         }
 
         _audit.Items.Clear();
@@ -146,7 +155,11 @@ internal sealed class AuthMainForm : ManagerForm
         if (SelectedComputer() is not { } c) return;
         ComputerStore.Update(_paths, s =>
         {
-            foreach (var r in s.Computers.Where(r => Same(r, c))) r.Revoked = blocked;
+            foreach (var r in s.Computers.Where(r => Same(r, c)))
+            {
+                r.Revoked = blocked;
+                if (!blocked) r.Pending = false;   // approving a waiting computer
+            }
             return 0;
         });
         AuthData.Audit(_paths, $"{(blocked ? "BLOCKED" : "ALLOWED")}  computer {c.Name} in the Auth Console");

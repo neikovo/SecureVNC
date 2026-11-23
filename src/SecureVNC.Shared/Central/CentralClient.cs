@@ -88,9 +88,27 @@ public static class CentralClient
         if (!File.Exists(ServerPaths.ServerCertFile))
             throw new InvalidOperationException("Not joined to the auth server yet.");
         var server = CertificateManager.LoadProtected(ServerPaths.ServerCertFile);
+        if (server.NotAfter < DateTime.Now && File.Exists(ServerPaths.JoinKeyFile)
+            && DateTime.UtcNow - _lastRenewAttemptUtc > TimeSpan.FromMinutes(10))
+        {
+            // Off for more than a week: an expired certificate cannot be renewed, join again with the saved key.
+            _lastRenewAttemptUtc = DateTime.UtcNow;
+            try
+            {
+                var joinKey = Encoding.UTF8.GetString(Dpapi.Unprotect(File.ReadAllBytes(ServerPaths.JoinKeyFile)));
+                Join(config.AuthServer!, config.AuthServerFingerprint!, joinKey, log);
+                server.Dispose();
+                server = CertificateManager.LoadProtected(ServerPaths.ServerCertFile);
+            }
+            catch (Exception ex)
+            {
+                log($"Certificate expired and joining again failed: {ex.Message}");
+            }
+        }
         var (_, localIps) = CertificateManager.CurrentIdentity();
-        bool needsRenewal = forceReissue || server.NotAfter < DateTime.Now.AddDays(30)
-                            || !CertificateManager.SanAddresses(server).Any(localIps.Contains);
+        var sanIps = CertificateManager.SanAddresses(server);
+        bool needsRenewal = forceReissue || server.NotAfter < DateTime.Now + CentralProtocol.ComputerCertificateRenewBefore
+                            || (sanIps.Count > 0 && !sanIps.Any(localIps.Contains));
 
         if (needsRenewal && (forceReissue || DateTime.UtcNow - _lastRenewAttemptUtc > TimeSpan.FromMinutes(10)))
         {
@@ -126,6 +144,10 @@ public static class CentralClient
         using var withKey = issued.CopyWithPrivateKey(key);
         CertificateManager.SaveProtected(withKey, ServerPaths.ServerCertFile);
     }
+
+    /// <summary>One raw request (tests and diagnostics).</summary>
+    public static CentralResponse Request(string server, string caFingerprint, X509Certificate2? clientCert, CentralRequest request) =>
+        Call(server, caFingerprint, clientCert, request);
 
     private static CentralResponse Call(string server, string caFingerprint, X509Certificate2? clientCert, CentralRequest request)
     {

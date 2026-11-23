@@ -10,6 +10,8 @@ internal sealed class RfbServer(ServerConfig config)
 {
     private readonly IReadOnlyList<IPNetwork> _allowed = config.ParseAllowedNetworks();
     private readonly AuthThrottle _throttle = new(config.MaxFailedAttempts, TimeSpan.FromMinutes(config.LockoutMinutes));
+    private readonly ConnectionLimiter _limiter = new(maxTotal: 32, maxPerAddress: 4);
+    private System.Threading.Timer? _renewTimer;
     private readonly List<ClientSession> _sessions = [];
     private readonly CancellationTokenSource _cts = new();
     private readonly object _credsLock = new();
@@ -36,11 +38,19 @@ internal sealed class RfbServer(ServerConfig config)
         _listener.Start();
         Log.Info($"Listening on port {config.Port}; allowed networks: {string.Join(", ", config.AllowedNetworks)}");
         _ = AcceptLoop();
+
+        // Keep the certificate fresh even when nobody connects (central mode: 7-day certificates).
+        _renewTimer = new System.Threading.Timer(_ =>
+        {
+            try { GetCredentials(); }
+            catch (Exception ex) { Log.Info($"Certificate check failed: {ex.Message}"); }
+        }, null, TimeSpan.FromMinutes(30), TimeSpan.FromMinutes(30));
     }
 
     public void Stop()
     {
         _cts.Cancel();
+        _renewTimer?.Dispose();
         _listener?.Stop();
         DisconnectAll();
         Log.Info("Server stopped");
@@ -79,6 +89,17 @@ internal sealed class RfbServer(ServerConfig config)
                 continue;
             }
 
+            if (!_limiter.TryEnter(ip, Log.Info))
+            {
+                tcp.Dispose();
+                continue;
+            }
+            int counted = 1;
+            void Release()
+            {
+                if (Interlocked.Exchange(ref counted, 0) == 1) _limiter.Leave(ip);
+            }
+
             ServerCredentials creds;
             try
             {
@@ -88,19 +109,22 @@ internal sealed class RfbServer(ServerConfig config)
             {
                 Log.Info($"Cannot load certificates: {ex.Message}");
                 tcp.Dispose();
+                Release();
                 continue;
             }
 
             var session = new ClientSession(tcp, ip, config, creds, _throttle);
             session.Authenticated += s =>
             {
+                Release();   // logged in: no longer counts against the limit for half-open connections
                 lock (_sessions) _sessions.Add(s);
                 SessionStarted?.Invoke(s);
             };
             // A dedicated thread (not the thread pool): it switches desktops with SetThreadDesktop.
             new Thread(() =>
             {
-                session.Run();
+                try { session.Run(); }
+                finally { Release(); }
                 bool wasActive;
                 lock (_sessions) wasActive = _sessions.Remove(session);
                 if (wasActive) SessionEnded?.Invoke(session);

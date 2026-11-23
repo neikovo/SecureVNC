@@ -18,6 +18,13 @@ namespace SecureVNC.Shared.Central;
 public static class CentralProtocol
 {
     public const int DefaultPort = 5902;
+
+    /// <summary>
+    /// Computer certificates live 7 days and are renewed after 3: a blocked computer cannot renew, so viewers stop
+    /// trusting it within a week (viewers do not ask the auth server about blocked computers).
+    /// </summary>
+    public static readonly TimeSpan ComputerCertificateLifetime = TimeSpan.FromDays(7);
+    public static readonly TimeSpan ComputerCertificateRenewBefore = TimeSpan.FromDays(4);
     private const int MaxMessageBytes = 64 * 1024;
 
     public static void Write<T>(Stream stream, T message)

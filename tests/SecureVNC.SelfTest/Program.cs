@@ -175,10 +175,51 @@ err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "tester
 Check(err is AuthenticationException, $"central: local-only user rejected ({err?.Message})");
 Check(AuthData.RecentAudit(authPaths, 20).Any(l => l.Contains("LOGIN  user 'central'")), "auth server audit log has the login");
 
+using (var issued = CertificateManager.LoadProtected(ServerPaths.ServerCertFile))
+    Check(issued.NotAfter <= DateTime.Now.AddDays(7).AddHours(1), $"computer certificate lives 7 days (until {issued.NotAfter:yyyy-MM-dd HH:mm})");
+
+// Someone with the join key enrolls another computer from an address a registered computer uses.
+string NewPublicKey() { using var k = System.Security.Cryptography.ECDsa.Create(); return Convert.ToBase64String(k.ExportSubjectPublicKeyInfo()); }
+var fake = CentralClient.Request(authAddress, fingerprint, null, new CentralRequest
+{
+    Op = "enroll", JoinKey = joinKey, MachineName = "FAKE-PC", MachineGuid = Guid.NewGuid().ToString(), PublicKey = NewPublicKey(),
+});
+using (var fakeCert = new System.Security.Cryptography.X509Certificates.X509Certificate2(Convert.FromBase64String(fake.Certificate ?? "")))
+    Check(fake.Ok && CertificateManager.SanAddresses(fakeCert).Count == 0, "address used by another computer is left out of a new certificate");
+
+var approvalConfig = AuthConfig.Load(authPaths);
+approvalConfig.RequireApproval = true;
+approvalConfig.Save(authPaths);
+var waiting = CentralClient.Request(authAddress, fingerprint, null, new CentralRequest
+{
+    Op = "enroll", JoinKey = joinKey, MachineName = "WAIT-PC", MachineGuid = Guid.NewGuid().ToString(), PublicKey = NewPublicKey(),
+});
+Check(waiting.Ok && ComputerStore.Load(authPaths).Computers.Single(c => c.Name == "WAIT-PC").Pending, "with approval required, a new computer waits");
+approvalConfig.RequireApproval = false;
+approvalConfig.Save(authPaths);
+
 ComputerStore.Update(authPaths, s => s.Computers[0].Revoked = true);
 err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central", password, CentralCode(1)), TrustStore.Load(), Trust).Dispose());
-Check(err is AuthenticationException, $"central: removed computer cannot log anyone in ({err?.Message})");
+Check(err is AuthenticationException, $"central: blocked computer cannot log anyone in ({err?.Message})");
+err = Try(() => CentralClient.Join(authAddress, fingerprint, joinKey, _ => { }));
+Check(err?.Message.Contains("blocked") == true, $"blocked computer cannot unblock itself by joining again ({err?.Message})");
 ComputerStore.Update(authPaths, s => s.Computers[0].Revoked = false);
+
+// Half-open connections are capped per address; the cap frees up again.
+var raw = new List<System.Net.Sockets.TcpClient>();
+for (int i = 0; i < 4; i++) { var t = new System.Net.Sockets.TcpClient(); t.Connect("127.0.0.1", 15901); raw.Add(t); }
+Thread.Sleep(300);
+var extra = new System.Net.Sockets.TcpClient();
+extra.Connect("127.0.0.1", 15901);
+extra.GetStream().ReadTimeout = 3000;
+int readResult = -2;
+try { readResult = extra.GetStream().Read(new byte[1], 0, 1); } catch (IOException) { readResult = -1; }
+Check(readResult <= 0, $"5th half-open connection from one address is closed at once (read={readResult})");
+extra.Dispose();
+foreach (var t in raw) t.Dispose();
+Thread.Sleep(500);
+
+Check(Log.OneLine("bob\r\n2026-01-01 LOGIN  user 'admin'") == "bob  2026-01-01 LOGIN  user 'admin'", "log lines cannot be split by names from the network");
 
 auth.Stop();
 Thread.Sleep(300);

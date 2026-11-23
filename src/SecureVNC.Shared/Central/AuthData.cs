@@ -35,6 +35,8 @@ public sealed class AuthConfig
     public List<string> AllowedNetworks { get; set; } = new ServerConfig().AllowedNetworks;
     public int MaxFailedAttempts { get; set; } = 5;
     public int LockoutMinutes { get; set; } = 5;
+    /// <summary>New computers may log no one in until an administrator approves them in the Auth Console.</summary>
+    public bool RequireApproval { get; set; }
 
     public static AuthConfig Load(AuthPaths paths) =>
         File.Exists(paths.ConfigFile)
@@ -53,7 +55,14 @@ public sealed class ComputerRecord
     public DateTime JoinedUtc { get; set; }
     public DateTime LastSeenUtc { get; set; }
     public string LastAddress { get; set; } = "";
+    /// <summary>Blocked in the Auth Console: cannot log anyone in, renew its certificate or join again.</summary>
     public bool Revoked { get; set; }
+    /// <summary>Joined while approval is required: waits for an administrator.</summary>
+    public bool Pending { get; set; }
+
+    public bool Same(string name, string machineGuid) =>
+        string.Equals(Name, name, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(MachineGuid, machineGuid, StringComparison.OrdinalIgnoreCase);
 }
 
 /// <summary>Computers that joined the auth server.</summary>
@@ -107,7 +116,7 @@ public static class AuthData
     /// <summary>First start: organization CA, the auth server's TLS certificate and a join key.</summary>
     public static void Initialize(AuthPaths paths, Action<string> log)
     {
-        ServerPaths.SecureDirectory(paths.DataDir);
+        ServerPaths.SecureDirectory(paths.DataDir, fresh: !paths.IsInitialized);
         if (!File.Exists(paths.ConfigFile)) new AuthConfig().Save(paths);
         if (!File.Exists(paths.CaKeyFile))
         {
@@ -143,7 +152,7 @@ public static class AuthData
             try
             {
                 Directory.CreateDirectory(paths.LogDir);
-                File.AppendAllText(AuditFile(paths, DateTime.Now), $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {line}{Environment.NewLine}");
+                File.AppendAllText(AuditFile(paths, DateTime.Now), $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {Log.OneLine(line)}{Environment.NewLine}");
             }
             catch
             {

@@ -107,6 +107,7 @@ public sealed class RfbClient : IDisposable
         Send(w => w.U8(1));   // ClientInit: shared
         Width = _r.U16();
         Height = _r.U16();
+        CheckScreenSize(Width, Height);
         var pf = _r.ReadBytes(16);
         if (pf[0] != 32) throw new ProtocolException("Unsupported pixel format.");
         DesktopName = _r.LengthPrefixedString(1024);
@@ -218,9 +219,12 @@ public sealed class RfbClient : IDisposable
         {
             int x = r.U16(), y = r.U16(), w = r.U16(), h = r.U16();
             int encoding = r.S32();
+            if (encoding != Rfb.PseudoEncodingDesktopSize && (x + w > Width || y + h > Height))
+                throw new ProtocolException("Rectangle outside the screen.");
             switch (encoding)
             {
                 case Rfb.PseudoEncodingDesktopSize:
+                    CheckScreenSize(w, h);
                     lock (FrameLock)
                     {
                         Frame?.Dispose();
@@ -264,7 +268,7 @@ public sealed class RfbClient : IDisposable
         if (w == 0 || h == 0) return;
         lock (FrameLock)
         {
-            if (Frame is null || x + w > Frame.Width || y + h > Frame.Height)
+            if (Frame is null || x + w > Frame.Width || y + h > Frame.Height || (long)w * h * 4 > _pixels.Length)
                 throw new ProtocolException("Rectangle outside the screen.");
             var data = Frame.LockBits(new Rectangle(x, y, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
             try
@@ -282,6 +286,15 @@ public sealed class RfbClient : IDisposable
             }
         }
     }
+
+    /// <summary>A malicious server must not make the client allocate gigabytes or overflow size calculations.</summary>
+    private static void CheckScreenSize(int width, int height)
+    {
+        if (width > MaxScreenSide || height > MaxScreenSide)
+            throw new ProtocolException($"Screen size {width}x{height} is not supported.");
+    }
+
+    private const int MaxScreenSide = 16384;   // 16384 x 16384 x 4 bytes = 1 GiB at most; real screens are far smaller
 
     private static void EnsureCapacity(ref byte[] buffer, int size)
     {

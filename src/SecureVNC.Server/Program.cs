@@ -48,6 +48,7 @@ internal static class Program
 
         try
         {
+            ServerPaths.Harden(ServerPaths.DataDir);   // only Administrators/SYSTEM may own anything in the data folder
             MachineIdentity.Guard(Log.Info);   // cloned or renamed computer: make its own keys first
         }
         catch (Exception ex)
