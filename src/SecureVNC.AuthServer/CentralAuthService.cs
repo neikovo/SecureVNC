@@ -1,5 +1,8 @@
+using System.IO.Pipes;
 using System.Net;
 using System.Net.Security;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Security.Cryptography;
@@ -13,59 +16,192 @@ using SecureVNC.Shared.Security;
 namespace SecureVNC.AuthServer;
 
 /// <summary>
-/// SecureVNC Auth Server: administrators (password + Google Authenticator) are kept here, computers ask it
-/// to check every login. Computers join with the join key and get a certificate from the organization CA,
-/// which they then use to prove who they are. Every decision goes to the audit log.
+/// SecureVNC Auth Server: administrators (password + Google Authenticator) are kept here, viewers get tickets here,
+/// computers join with the join key and get a certificate from the organization CA. Every decision goes to the audit.
+/// All secrets are sealed with the master password (see <see cref="Vault"/>): after a restart the server is locked -
+/// it does not even listen on the network - until an administrator unlocks it in the Auth Console (local pipe).
 /// </summary>
 public sealed partial class CentralAuthService(AuthPaths paths)
 {
-    private readonly AuthConfig _config = AuthConfig.Load(paths);
+    private AuthConfig _config = AuthConfig.Load(paths);
     private readonly CancellationTokenSource _cts = new();
     private readonly object _credsLock = new();
-    private AuthThrottle? _throttle;
+    private readonly object _stateLock = new();
+    private readonly AuthThrottle _unlockThrottle = new(5, TimeSpan.FromMinutes(5));
+    private AuthThrottle _throttle = new(5, TimeSpan.FromMinutes(5));
+    private CancellationTokenSource? _listenCts;
     private TcpListener? _listener;
     private ServerCredentials? _creds;
     private DateTime _credsCheckedUtc;
     private X509Certificate2? _ca;
+    private X509Certificate2? _caKey;
+    private string? _listenAddress;
     private readonly ConnectionLimiter _limiter = new(maxTotal: 64, maxPerAddress: 8);
     private readonly TicketBook _tickets = new();
 
     public int Port => _config.Port;
 
-    public void Start(string? listenAddress = null)
+    /// <summary>"not-set-up" (no master password yet), "locked" or "unlocked".</summary>
+    public string State
     {
-        if (paths.IsInitialized) ServerPaths.Harden(paths.DataDir);   // ownership and links, see ServerPaths
-        else AuthData.Initialize(paths, Log.Info);
-        _ca = new X509Certificate2(File.ReadAllBytes(paths.CaCertFile));
-        _throttle = new AuthThrottle(_config.MaxFailedAttempts, TimeSpan.FromMinutes(_config.LockoutMinutes));
-        GetCredentials();
+        get
+        {
+            lock (_stateLock) return !paths.IsInitialized ? "not-set-up" : _caKey is null ? "locked" : "unlocked";
+        }
+    }
 
-        var address = IPAddress.Parse(listenAddress ?? _config.ListenAddress);
-        _listener = new TcpListener(address, _config.Port);
-        if (address.Equals(IPAddress.IPv6Any)) _listener.Server.DualMode = true;
-        _listener.Start();
-        Log.Info($"Auth server listening on port {_config.Port}");
-        _ = AcceptLoop();
+    /// <summary>Starts locked: only the local unlock pipe runs until <see cref="Unlock"/>.</summary>
+    public void Start(string? listenAddress = null, bool unlockPipe = true)
+    {
+        if (Directory.Exists(paths.DataDir)) ServerPaths.Harden(paths.DataDir);   // ownership and links, see ServerPaths
+        AuthData.Prepare(paths);
+        _config = AuthConfig.Load(paths);
+        _listenAddress = listenAddress;
+        if (unlockPipe) _ = Task.Run(PipeLoopAsync);
+        Log.Info(State == "not-set-up"
+            ? "Auth server waits for a master password (open the SecureVNC Auth Console)"
+            : "Auth server is locked: enter the master password in the SecureVNC Auth Console");
     }
 
     public void Stop()
     {
+        Lock("service stopping");
         _cts.Cancel();
-        _listener?.Stop();
         Log.Info("Auth server stopped");
     }
 
-    private async Task AcceptLoop()
+    /// <summary>Opens the vault with the master password and starts serving the network.</summary>
+    public void Unlock(string masterPassword)
+    {
+        lock (_stateLock)
+        {
+            if (!paths.IsInitialized) throw new InvalidOperationException("No master password has been set yet.");
+            if (_caKey is not null) return;
+            if (_unlockThrottle.IsLocked("unlock")) throw new InvalidOperationException("Too many wrong master passwords. Wait 5 minutes.");
+            try
+            {
+                Vault.Unlock(paths, masterPassword);
+            }
+            catch (System.Security.Cryptography.CryptographicException)
+            {
+                _unlockThrottle.Fail("unlock");
+                AuditLine("UNLOCK-FAILED  wrong master password");
+                Thread.Sleep(1000);
+                throw new InvalidOperationException("Wrong master password.");
+            }
+            _unlockThrottle.Success("unlock");
+            _caKey = AuthData.OpenCa(paths);
+            _ca = new X509Certificate2(File.ReadAllBytes(paths.CaCertFile));
+            _throttle = new AuthThrottle(_config.MaxFailedAttempts, TimeSpan.FromMinutes(_config.LockoutMinutes));
+            _creds = null;
+            GetCredentials();
+
+            var address = IPAddress.Parse(_listenAddress ?? _config.ListenAddress);
+            _listenCts = new CancellationTokenSource();
+            _listener = new TcpListener(address, _config.Port);
+            if (address.Equals(IPAddress.IPv6Any)) _listener.Server.DualMode = true;
+            _listener.Start();
+            _ = AcceptLoop(_listener, _listenCts.Token);
+            AuditLine($"UNLOCKED  auth server listening on port {_config.Port}");
+        }
+    }
+
+    /// <summary>Forgets the keys and stops serving the network until the master password is entered again.</summary>
+    public void Lock(string reason)
+    {
+        lock (_stateLock)
+        {
+            if (_caKey is null) return;
+            _listenCts?.Cancel();
+            _listener?.Stop();
+            _caKey.Dispose();
+            _caKey = null;
+            lock (_credsLock) _creds = null;
+            Vault.Lock();
+            AuditLine($"LOCKED  ({reason})");
+        }
+    }
+
+    /// <summary>Local pipe for the Auth Console: status, unlock, lock, administrator login check, join key.</summary>
+    private async Task PipeLoopAsync()
+    {
+        var security = new PipeSecurity();
+        foreach (var sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
+            security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(sid, null), PipeAccessRights.FullControl, AccessControlType.Allow));
+
+        while (!_cts.IsCancellationRequested)
+        {
+            try
+            {
+                using var pipe = NamedPipeServerStreamAcl.Create(AuthPipe.Name, PipeDirection.InOut, 1,
+                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security);
+                await pipe.WaitForConnectionAsync(_cts.Token);
+                var request = CentralProtocol.Read<AuthPipeRequest>(pipe);
+                CentralProtocol.Write(pipe, HandlePipe(request));
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Log.Info($"Unlock pipe: {ex.Message}");
+                try { await Task.Delay(500, _cts.Token); } catch (OperationCanceledException) { break; }
+            }
+        }
+    }
+
+    private AuthPipeResponse HandlePipe(AuthPipeRequest r)
+    {
+        try
+        {
+            switch (r.Op)
+            {
+                case "status":
+                    return new AuthPipeResponse { Ok = true, State = State };
+                case "unlock":
+                    Unlock(r.Password ?? "");
+                    return new AuthPipeResponse { Ok = true, State = State };
+                case "lock":
+                    Lock("Auth Console");
+                    return new AuthPipeResponse { Ok = true, State = State };
+                case "verify":
+                {
+                    if (State != "unlocked") return new AuthPipeResponse { Error = "The auth server is locked." };
+                    string key = $"console:{(r.User ?? "").ToLowerInvariant()}";
+                    bool ok = !_throttle.IsLocked(key) && UserStore.Authenticate(paths.UsersFile, r.User ?? "", r.Password ?? "", r.Code ?? "");
+                    if (ok) _throttle.Success(key); else { _throttle.Fail(key); Thread.Sleep(1000); }
+                    AuditLine($"{(ok ? "CONSOLE-LOGIN" : "CONSOLE-LOGIN-FAILED")}  user '{r.User}'");
+                    return ok ? new AuthPipeResponse { Ok = true } : new AuthPipeResponse { Error = "Wrong user name, password or code." };
+                }
+                case "joinkey":
+                    if (State != "unlocked") return new AuthPipeResponse { Error = "The auth server is locked." };
+                    return new AuthPipeResponse { Ok = true, JoinKey = AuthData.ReadJoinKey(paths) };
+                default:
+                    return new AuthPipeResponse { Error = "Unknown request." };
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+        {
+            return new AuthPipeResponse { Error = ex.Message, State = State };
+        }
+    }
+
+    private async Task AcceptLoop(TcpListener listener, CancellationToken token)
     {
         var allowed = _config.AllowedNetworks.Select(IPNetwork.Parse).ToList();
-        while (!_cts.IsCancellationRequested)
+        while (!token.IsCancellationRequested)
         {
             TcpClient tcp;
             try
             {
-                tcp = await _listener!.AcceptTcpClientAsync(_cts.Token);
+                tcp = await listener.AcceptTcpClientAsync(token);
             }
-            catch (Exception) when (_cts.IsCancellationRequested)
+            catch (Exception) when (token.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
             {
                 break;
             }
@@ -330,8 +466,7 @@ public sealed partial class CentralAuthService(AuthPaths paths)
             Nonce = Convert.ToBase64String(nonce),
             IssuedUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
         };
-        using var ca = CertificateManager.LoadProtected(paths.CaKeyFile);
-        using var key = ca.GetECDsaPrivateKey()!;
+        using var key = (_caKey ?? throw new InvalidOperationException("locked")).GetECDsaPrivateKey()!;
         var (ticket, signature) = Tickets.Sign(payload, key);
         _tickets.Add(payload);
         AuditLine($"TICKET  user '{payload.User}' from {viewer} to {computer.Name}");
@@ -378,7 +513,7 @@ public sealed partial class CentralAuthService(AuthPaths paths)
         if (holder is not null)
             AuditLine($"ADDRESS-IN-USE  {name}: {address} was used by {holder.Name}; certificate issued for the name only");
 
-        using var ca = CertificateManager.LoadProtected(paths.CaKeyFile);
+        var ca = _caKey ?? throw new InvalidOperationException("locked");
         var cert = CertificateManager.IssueCertificate(ca, publicKey, name, [name, name + ".local"], ips, clientAuth: true,
             CentralProtocol.ComputerCertificateLifetime);
         return (cert, holder is null ? address : "");
@@ -396,7 +531,15 @@ public sealed partial class CentralAuthService(AuthPaths paths)
         {
             if (_creds is null || DateTime.UtcNow - _credsCheckedUtc > TimeSpan.FromMinutes(1))
             {
-                _creds = CertificateManager.EnsureLeaf(paths.CaKeyFile, paths.TlsCertFile, Log.Info, extraEku: Tickets.AuthServerEkuOid);
+                // The TLS certificate lives only in memory: issued from the unlocked CA, re-issued when addresses change.
+                var ca = _caKey ?? throw new InvalidOperationException("The auth server is locked.");
+                var (dns, ips) = CertificateManager.CurrentIdentity();
+                if (_creds is null || _creds.ServerCertificate.NotAfter < DateTime.Now.AddDays(30) || !CertificateManager.Covers(_creds.ServerCertificate, dns, ips))
+                {
+                    using var fresh = CertificateManager.IssueServerCertificate(ca, dns, ips, Tickets.AuthServerEkuOid);
+                    var leaf = new X509Certificate2(fresh.Export(X509ContentType.Pkcs12), (string?)null, X509KeyStorageFlags.Exportable);
+                    _creds = new ServerCredentials(leaf, _ca!, SslStreamCertificateContext.Create(leaf, [_ca!], offline: true));
+                }
                 _credsCheckedUtc = DateTime.UtcNow;
             }
             return _creds;

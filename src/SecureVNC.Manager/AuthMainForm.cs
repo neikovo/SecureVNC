@@ -16,6 +16,7 @@ internal sealed class AuthMainForm : ManagerForm
     private readonly ListBox _audit = new() { Width = 615, Height = 220, Font = new Font("Consolas", 8.5f), HorizontalScrollbar = true };
     private readonly CheckBox _approval = new() { Text = "New computers need my approval before they can log anyone in", AutoSize = true };
     private bool _keyShown;
+    private readonly Label _vault = new() { AutoSize = true, MaximumSize = new Size(ContentWidth, 0) };
 
     public AuthMainForm(AuthPaths paths, bool firstRun, string? user)
         : base(user is null ? "SecureVNC Auth Console" : $"SecureVNC Auth Console - {user}", "SecureVNCAuth")
@@ -24,6 +25,7 @@ internal sealed class AuthMainForm : ManagerForm
 
         var server = Group("Auth server");
         server.Controls.Add(ServiceLabel);
+        server.Controls.Add(_vault);
         server.Controls.Add(_connect);
         server.Controls.Add(new Label
         {
@@ -37,11 +39,14 @@ internal sealed class AuthMainForm : ManagerForm
         server.Controls.Add(Buttons(
             ("Copy fingerprint", () => Clipboard.SetText(_fingerprint.Text)),
             ("Show / hide join key", ToggleKey),
-            ("Copy join key", () => Clipboard.SetText(AuthData.ReadJoinKey(_paths))),
+            ("Copy join key", () => Clipboard.SetText(ReadJoinKey())),
             ("New join key...", NewJoinKey)));
         server.Controls.Add(Buttons(
             ("Export CA for clients...", () => ExportCa(_paths.CaCertFile, "SecureVNC-Organization-CA.cer",
                 "Import this file once in SecureVNC Client (\"Import CA...\"): it then trusts every computer joined to this auth server.")),
+            ("Lock now", LockNow),
+            ("Change master password...", ChangeMasterPassword)));
+        server.Controls.Add(Buttons(
             ("Restart service", RestartService),
             ("Open logs", () => Process.Start(new ProcessStartInfo(_paths.LogDir) { UseShellExecute = true }))));
 
@@ -102,7 +107,16 @@ internal sealed class AuthMainForm : ManagerForm
         var config = AuthConfig.Load(_paths);
         _connect.Text = $"Computers connect to: {Environment.MachineName} or {string.Join(", ", NetworkInfo.LanAddresses())}   port {config.Port}";
         _fingerprint.Text = AuthData.CaFingerprint(_paths);
-        _joinKey.Text = _keyShown ? AuthData.ReadJoinKey(_paths) : "•••• - •••• - •••• - •••• - •••• - ••••";
+        _joinKey.Text = _keyShown ? ReadJoinKey() : "•••• - •••• - •••• - •••• - •••• - ••••";
+        var state = AuthPipe.State();
+        _vault.Text = state switch
+        {
+            "unlocked" => "Master password: entered - the auth server is unlocked and serving the network.",
+            "locked" => "Master password: NOT entered - the auth server is locked; nobody can log in anywhere.",
+            null => "The auth server service is not running.",
+            _ => "No master password set.",
+        };
+        _vault.ForeColor = state == "unlocked" ? Color.DarkGreen : Color.Firebrick;
         _admins.Reload();
 
         _computers.Items.Clear();
@@ -116,6 +130,33 @@ internal sealed class AuthMainForm : ManagerForm
 
         _audit.Items.Clear();
         foreach (var line in AuthData.RecentAudit(_paths, 300)) _audit.Items.Add(line);
+    }
+
+    /// <summary>The join key is sealed: only the unlocked service can read it.</summary>
+    private string ReadJoinKey()
+    {
+        var r = AuthPipe.Send(new AuthPipeRequest { Op = "joinkey" });
+        return r.Ok ? r.JoinKey! : throw new InvalidOperationException(r.Error ?? "The auth server is locked.");
+    }
+
+    private void LockNow()
+    {
+        if (MessageBox.Show(this, "Lock the auth server now? Nobody can log in to any computer until the master password is entered again.",
+                "SecureVNC", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        AuthPipe.Send(new AuthPipeRequest { Op = "lock" });
+        Application.Exit();   // the console itself needed the unlocked server for its login
+    }
+
+    private void ChangeMasterPassword()
+    {
+        using var dlg = new MasterPasswordDialog(MasterPasswordMode.Change, (oldPassword, newPassword) =>
+        {
+            Vault.ChangePassword(_paths, oldPassword, newPassword);
+            AuthData.Audit(_paths, "MASTER-PASSWORD changed in the Auth Console");
+            return null;
+        });
+        if (dlg.ShowDialog(this) == DialogResult.OK)
+            MessageBox.Show(this, "Master password changed. Keep the new one in a safe place.", "SecureVNC", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private void ToggleKey()

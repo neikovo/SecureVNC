@@ -66,11 +66,20 @@ public sealed partial class UserStore
     public UserRecord? Find(string name) =>
         Users.FirstOrDefault(u => string.Equals(u.Name, name, StringComparison.OrdinalIgnoreCase));
 
+    /// <summary>
+    /// How new authenticator secrets are protected. Default: Windows DPAPI (computers). The Auth Console switches it to
+    /// the auth server's vault (master password); secrets are then stored as "sealed:...".
+    /// </summary>
+    public static Func<byte[], string> SealSecret { get; set; } = secret => Convert.ToBase64String(Dpapi.Protect(secret));
+
+    private static byte[] OpenSecret(string stored) =>
+        Central.Vault.IsSealedText(stored) ? Central.Vault.UnsealText(stored) : Dpapi.Unprotect(Convert.FromBase64String(stored));
+
     public static UserRecord CreateRecord(string name, string password, byte[] totpSecret, long acceptedStep) => new()
     {
         Name = name,
         PasswordHash = PasswordHasher.Hash(password),
-        TotpSecret = Convert.ToBase64String(Dpapi.Protect(totpSecret)),
+        TotpSecret = SealSecret(totpSecret),
         LastTotpStep = acceptedStep,
         CreatedUtc = DateTime.UtcNow,
     };
@@ -95,7 +104,7 @@ public sealed partial class UserStore
             }
             if (!PasswordHasher.Verify(password, user.PasswordHash)) return false;
 
-            var secret = Dpapi.Unprotect(Convert.FromBase64String(user.TotpSecret));
+            var secret = OpenSecret(user.TotpSecret);
             long step;
             try { step = Totp.Verify(secret, code, DateTimeOffset.UtcNow); }
             finally { CryptographicOperations.ZeroMemory(secret); }

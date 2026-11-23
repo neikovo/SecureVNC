@@ -4,7 +4,7 @@ using SecureVNC.Shared.Central;
 using SecureVNC.Shared.Hosting;
 
 // SecureVNC Auth Server: Windows service "SecureVNCAuth".
-//   --init      create the organization CA, TLS certificate and join key (installer), print them
+//   --init      create the (locked) data folder and settings; the master password is set in the Auth Console
 //   --console   run in this window (testing)
 var paths = new AuthPaths(AuthPaths.DefaultDir);
 ServerPaths.UseDataDir(paths.DataDir);   // logs go to %ProgramData%\SecureVNC-Auth\logs
@@ -17,8 +17,10 @@ if (args.Contains("--init"))
         Console.Error.WriteLine("Run as administrator.");
         return 1;
     }
-    AuthData.Initialize(paths, Console.WriteLine);
-    Console.WriteLine($"CA fingerprint: {AuthData.CaFingerprint(paths)}");
+    AuthData.Prepare(paths);
+    Console.WriteLine(paths.IsInitialized
+        ? $"Ready. CA fingerprint: {AuthData.CaFingerprint(paths)}"
+        : "Ready. Open the SecureVNC Auth Console to set the master password.");
     return 0;
 }
 
@@ -26,6 +28,8 @@ if (args.Contains("--console"))
 {
     var service = new CentralAuthService(paths);
     service.Start();
+    Console.Write("Master password: ");
+    service.Unlock(Console.ReadLine() ?? "");
     Console.WriteLine($"SecureVNC Auth Server on port {service.Port}. Press Enter to stop.");
     Console.ReadLine();
     service.Stop();

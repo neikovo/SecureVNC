@@ -67,6 +67,13 @@ internal static class Program
         Application.Run(new MainForm(firstRun, user));
     }
 
+    /// <summary>Sends the master password to the local auth service; null when it is unlocked, otherwise the reason.</summary>
+    internal static string? Unlock(string masterPassword)
+    {
+        var r = AuthPipe.Send(new AuthPipeRequest { Op = "unlock", Password = masterPassword }, 30_000);
+        return r.Ok ? null : r.Error ?? "Could not unlock.";
+    }
+
     private static void RunAuthConsole(bool firstRun)
     {
         var paths = new AuthPaths(AuthPaths.DefaultDir);
@@ -74,7 +81,7 @@ internal static class Program
         Log.Source = "auth-console";
         try
         {
-            if (!paths.IsInitialized) AuthData.Initialize(paths, Log.Info);
+            AuthData.Prepare(paths);
         }
         catch (Exception ex)
         {
@@ -82,13 +89,47 @@ internal static class Program
             return;
         }
 
+        // 1. Master password: set it the first time (sealing older data), or unlock the service after a restart.
+        if (!paths.IsInitialized)
+        {
+            using var create = new MasterPasswordDialog(MasterPasswordMode.Create, (_, newPassword) =>
+            {
+                AuthData.Initialize(paths, newPassword, Log.Info);
+                if (AuthPipe.State() is not null) Unlock(newPassword);
+                return null;
+            }, migrating: paths.HasLegacyData);
+            if (create.ShowDialog() != DialogResult.OK) return;
+        }
+        var state = AuthPipe.State();
+        if (state == "locked")
+        {
+            using var unlock = new MasterPasswordDialog(MasterPasswordMode.Unlock, (password, _) => Unlock(password));
+            if (unlock.ShowDialog() != DialogResult.OK) return;
+            state = AuthPipe.State();
+        }
+        if (state is null)
+        {
+            MessageBox.Show("The SecureVNC Auth Server service is not running. Start it (Services > SecureVNC Auth Server), then open the Auth Console again.", "SecureVNC", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        // 2. New authenticator secrets are sealed to the vault (works while locked: public key only).
+        UserStore.SealSecret = secret => Vault.SealToText(paths, secret);
+
+        // 3. Administrator login, checked by the unlocked service (the console itself never holds the vault key).
         string? user = null;
         if (UserStore.Load().Users.Count > 0)
         {
+            if (state != "unlocked")
+            {
+                MessageBox.Show("The auth server must be running and unlocked to check your login.", "SecureVNC", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
             using var login = new LoginDialog("Unlock the SecureVNC Auth Console with an administrator: password and the code from Google Authenticator.",
-                (name, password, code) => UserStore.Authenticate(name, password, code)
-                    ? null
-                    : "Wrong user name, password or code. A code can be used only once: wait for the next one.");
+                (name, password, code) =>
+                {
+                    var r = AuthPipe.Send(new AuthPipeRequest { Op = "verify", User = name, Password = password, Code = code }, 10_000);
+                    return r.Ok ? null : (r.Error ?? "Wrong user name, password or code.") + " A code can be used only once: wait for the next one.";
+                });
             if (login.ShowDialog() != DialogResult.OK) return;
             user = login.UserName;
         }

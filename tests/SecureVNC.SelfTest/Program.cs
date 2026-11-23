@@ -207,20 +207,35 @@ Thread.Sleep(300);
 
 // ===== Central mode: SecureVNC Auth Server decides, the computer only asks =====
 var authPaths = new AuthPaths(Path.Combine(temp, "auth"));
-AuthData.Initialize(authPaths, _ => { });
+const string master = "correct horse master battery";
+AuthData.Initialize(authPaths, master, _ => { });
 var authConfig = AuthConfig.Load(authPaths);
 authConfig.Port = 15902;
 authConfig.Save(authPaths);
+UserStore.SealSecret = secret => Vault.SealToText(authPaths, secret);   // as the Auth Console does
 var adminSecret = Totp.NewSecret();
 var admins = UserStore.Load(authPaths.UsersFile);
 admins.Users.Add(UserStore.CreateRecord("central", password, adminSecret, acceptedStep: 0));
 var adminSecret2 = Totp.NewSecret();
 admins.Users.Add(UserStore.CreateRecord("central2", password, adminSecret2, acceptedStep: 0));
 admins.Save();
+UserStore.SealSecret = secret => Convert.ToBase64String(Dpapi.Protect(secret));   // computers keep using DPAPI
+
+// ----- Master password: everything secret on the auth server is sealed -----
+Check(UserStore.Load(authPaths.UsersFile).Users.All(u => Vault.IsSealedText(u.TotpSecret))
+      && !File.Exists(authPaths.LegacyCaKeyFile) && !File.Exists(authPaths.LegacyJoinKeyFile) && !File.Exists(authPaths.LegacyTlsCertFile)
+      && Try(() => AuthData.OpenCa(authPaths)) is not null,
+    "auth server secrets sealed: CA key and authenticator secrets unreadable without the master password");
 var auth = new CentralAuthService(authPaths);
-auth.Start("127.0.0.1");
-string fingerprint = AuthData.CaFingerprint(authPaths), joinKey = AuthData.ReadJoinKey(authPaths);
+auth.Start("127.0.0.1", unlockPipe: false);
 const string authAddress = "127.0.0.1:15902";
+err = Try(() => CentralClient.Join(authAddress, new string('A', 64), "x", _ => { }));
+Check(auth.State == "locked" && err is not null, $"after a restart the auth server is locked and not on the network ({err?.Message})");
+err = Try(() => auth.Unlock("this is not the master password"));
+Check(err is not null && auth.State == "locked", $"wrong master password refused ({err?.Message})");
+auth.Unlock(master);
+Check(auth.State == "unlocked", "master password unlocks the auth server");
+string fingerprint = AuthData.CaFingerprint(authPaths), joinKey = AuthData.ReadJoinKey(authPaths);
 
 err = Try(() => CentralClient.Join(authAddress, new string('A', 64), joinKey, _ => { }));
 Check(err is not null, $"join refuses an auth server with another CA fingerprint ({err?.Message})");
@@ -335,7 +350,8 @@ Check(err is not null && err.Message.Contains("not reachable"), $"central: auth 
 
 // A clone: the saved identity is another computer's -> joins again with the saved join key.
 auth = new CentralAuthService(authPaths);
-auth.Start("127.0.0.1");
+auth.Start("127.0.0.1", unlockPipe: false);
+auth.Unlock(master);
 File.WriteAllText(ServerPaths.IdentityFile, """{"machineGuid":"00000000-0000-0000-0000-000000000000","machineName":"ORIGINAL-PC"}""");
 bool rejoined = false;
 err = Try(() => rejoined = MachineIdentity.Guard(_ => { }));
@@ -344,6 +360,15 @@ Check(err is null && rejoined && MachineIdentity.Saved is { } id && MachineIdent
 err = Try(() => RfbClient.Connect(new ConnectOptions("127.0.0.1", 15901, "central2", password,
     Totp.Compute(adminSecret2, Totp.CurrentStep(DateTimeOffset.UtcNow) + 1)), TrustStore.Load(), Trust).Dispose());
 Check(err is null, $"central login after re-join {err?.Message}");
+
+// ----- Master password: lock, change -----
+auth.Lock("test");
+err = Try(() => Tickets.RequestTicket(authAddress, orgCa, "central2", password, "000000", myName, nonceA));
+Check(err is not null && auth.State == "locked", $"Lock now: the auth server leaves the network at once ({err?.Message})");
+auth.Unlock(master);
+Vault.ChangePassword(authPaths, master, "a completely new master password");
+Check(Try(() => Vault.Open(authPaths, master).Dispose()) is not null && Try(() => Vault.Open(authPaths, "a completely new master password").Dispose()) is null,
+    "master password change: the old one stops working, the new one opens the vault");
 
 // ----- Second audit -----
 // A: only Administrators / SYSTEM (or a member of Administrators) may own SecureVNC data.
