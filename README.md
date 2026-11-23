@@ -69,7 +69,7 @@
 ```powershell
 dotnet build
 dotnet run --project tests\SecureVNC.SelfTest
-.\scripts\build-installer.ps1   # -> dist\SecureVNC-Setup-<версия>.exe (иска Inno Setup 6)
+.\scripts\build-installer.ps1   # -> dist\SecureVNC-Setup-<версия>.exe + dist\SecureVNC-Client-Portable.zip (иска Inno Setup 6)
 ```
 
 `build-installer.ps1 -Version 1.1.0` за нова версия. `scripts\publish.ps1` прави само `dist\Server` и `dist\Client` (self-contained, без .NET на целевите машини).
